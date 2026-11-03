@@ -42,7 +42,7 @@ _TITLE_RETRY_TTL = 7 * 24 * 3600   # 标题轻量缓存失败时 7 天后重试
 # ═══════════════════════════════════════════════════════════════════════════
 
 _HTML_LAST_TS = 0.0
-_HTML_MIN_INTERVAL = 1.5   # 社区页爬取最小间隔（秒）—— 单用户单 IP 安全值，将来可配置
+_HTML_MIN_INTERVAL = 2.0   # 社区页爬取最小间隔（秒）—— Steam 社区页单 IP 限速阈值较严，2.0s 更安全
 _HTML_MAX_RECHECK_DAYS = 30  # 预判层最大重检间隔 —— 社区翻译是其他用户贡献的，
                               # 不触发 mod time_updated 变化，30 天强制重检一次
 
@@ -51,6 +51,7 @@ _HTML_CIRCUIT_OPEN_TS = 0.0   # 熔断开启的时间戳
 _HTML_CIRCUIT_COOLDOWN = 600.0  # 冷却 10 分钟
 _html_inflight: set[str] = set()  # 正在爬的 wid（去重）
 _html_lock = threading.Lock()
+_html_sem = threading.Semaphore(1)  # 并发上限：desc 回退路径同一时刻只有 1 个后台爬
 
 
 def _html_circuit_open() -> bool:
@@ -72,13 +73,14 @@ def _html_circuit_trigger() -> None:
 
 
 def _html_throttle() -> None:
-    """社区页 HTML 爬取统一节流（1.5s 间隔）。deps 和 desc 共用。"""
+    """社区页 HTML 爬取统一节流（2.0s 间隔）。deps 和 desc 共用。"""
     if _html_circuit_open():
         raise RuntimeError("HTML circuit breaker open — cooldown in effect")
     global _HTML_LAST_TS
     now = time.monotonic()
     delay = _HTML_LAST_TS + _HTML_MIN_INTERVAL - now
     if delay > 0:
+        _log.debug("[workshop] throttle wait %.2fs", delay)
         time.sleep(delay)
     _HTML_LAST_TS = time.monotonic()
 
@@ -453,6 +455,7 @@ def _fetch_html(workshop_id: str, language: str = "zh") -> tuple[Optional[str], 
                     _log.warning("[workshop] wid=%s HTTP 429，%.1fs 后重试 (%d/%d)",
                                  workshop_id, wait, attempt + 1, max_retries)
                     time.sleep(wait)
+                    _deps_throttle()
                     continue
                 _html_circuit_trigger()
                 _log.warning("[workshop] wid=%s HTTP 429 重试耗尽，触发熔断", workshop_id)
@@ -508,88 +511,89 @@ def _launch_async_html_fill(workshop_id: str, language: str, *,
         _html_inflight.add(workshop_id)
 
     def _do():
-        try:
-            # ── 预判层：time_updated 没变 + 30 天内检查过 → 不爬 ──
-            check_time = int(api_time_updated or 0)
-            if check_time <= 0:
-                # 没传 Web API 的值 → 查 steamDB（零网络成本）
-                try:
-                    from .steam_webapi import query_steamdb
-                    snap = query_steamdb(workshop_id)
-                    if snap:
-                        check_time = int(snap.get("time_updated") or 0)
-                except Exception:
-                    pass
+        with _html_sem:
+            try:
+                # ── 预判层：time_updated 没变 + 30 天内检查过 → 不爬 ──
+                check_time = int(api_time_updated or 0)
+                if check_time <= 0:
+                    # 没传 Web API 的值 → 查 steamDB（零网络成本）
+                    try:
+                        from .steam_webapi import query_steamdb
+                        snap = query_steamdb(workshop_id)
+                        if snap:
+                            check_time = int(snap.get("time_updated") or 0)
+                    except Exception:
+                        pass
 
-            cached_before = _load_cached(workshop_id, language)
-            if cached_before and check_time > 0 and cached_before.get("html_checked"):
-                cached_time = cached_before.get("html_time_updated")
-                if cached_time == check_time:
-                    # mod 没更新过，再看距上次检查多久
-                    last_checked = float(cached_before.get("html_last_checked_ts") or 0)
-                    days_since = max(0, (time.time() - last_checked) / 86400) if last_checked > 0 else 0
-                    if days_since < _HTML_MAX_RECHECK_DAYS:
-                        from datetime import datetime, timezone
-                        ts_str = datetime.fromtimestamp(last_checked, tz=timezone.utc).strftime("%Y-%m-%d") if last_checked > 0 else "never"
-                        _log.debug("[workshop] wid=%s time_updated 没变 (%d) 且 %.1f 天内检查过 (上次=%s) → 跳过",
-                                   workshop_id, check_time, days_since, ts_str)
-                        return
-                    _log.debug("[workshop] wid=%s time_updated 没变 (%d) 但已过 %.0f 天 → 强制重检",
-                               workshop_id, check_time, days_since)
+                cached_before = _load_cached(workshop_id, language)
+                if cached_before and check_time > 0 and cached_before.get("html_checked"):
+                    cached_time = cached_before.get("html_time_updated")
+                    if cached_time == check_time:
+                        # mod 没更新过，再看距上次检查多久
+                        last_checked = float(cached_before.get("html_last_checked_ts") or 0)
+                        days_since = max(0, (time.time() - last_checked) / 86400) if last_checked > 0 else 0
+                        if days_since < _HTML_MAX_RECHECK_DAYS:
+                            from datetime import datetime, timezone
+                            ts_str = datetime.fromtimestamp(last_checked, tz=timezone.utc).strftime("%Y-%m-%d") if last_checked > 0 else "never"
+                            _log.debug("[workshop] wid=%s time_updated 没变 (%d) 且 %.1f 天内检查过 (上次=%s) → 跳过",
+                                       workshop_id, check_time, days_since, ts_str)
+                            return
+                        _log.debug("[workshop] wid=%s time_updated 没变 (%d) 但已过 %.0f 天 → 强制重检",
+                                   workshop_id, check_time, days_since)
 
-            # ── 正式爬取 ──
-            html_text, fetch_reason = _fetch_html(workshop_id, language)
+                # ── 正式爬取 ──
+                html_text, fetch_reason = _fetch_html(workshop_id, language)
 
-            # 只有 fetch_reason=="ok" 且提取到中文 desc 才算成功
-            # 任何其他情况都走到下面的"判断是否临时失败"分支
-            if fetch_reason == "ok" and html_text is not None:
-                html_desc = _extract_html_description(html_text)
-                if html_desc and _has_chinese(html_desc):
-                    cached = _load_cached(workshop_id, language)
-                    if cached:
-                        cached["description"] = html_desc
-                        cached["desc_src"] = "html"
-                        cached["html_checked"] = True
-                        cached["html_time_updated"] = check_time
-                        cached["html_last_checked_ts"] = time.time()
-                        _save_cache(workshop_id, cached, None, "image/jpeg")
-                        _log.info("[workshop] wid=%s 后台 HTML 补中文 desc 完成", workshop_id)
-                        return
+                # 只有 fetch_reason=="ok" 且提取到中文 desc 才算成功
+                # 任何其他情况都走到下面的"判断是否临时失败"分支
+                if fetch_reason == "ok" and html_text is not None:
+                    html_desc = _extract_html_description(html_text)
+                    if html_desc and _has_chinese(html_desc):
+                        cached = _load_cached(workshop_id, language)
+                        if cached:
+                            cached["description"] = html_desc
+                            cached["desc_src"] = "html"
+                            cached["html_checked"] = True
+                            cached["html_time_updated"] = check_time
+                            cached["html_last_checked_ts"] = time.time()
+                            _save_cache(workshop_id, cached, None, "image/jpeg")
+                            _log.info("[workshop] wid=%s 后台 HTML 补中文 desc 完成", workshop_id)
+                            return
 
-            # 到这里: 要么 fetch_reason!="ok"（临时失败），要么 fetch_reason=="ok"
-            # 但社区 HTML 里确实没有中文 desc（作者没填 + 社区翻译系统也没覆盖）
-            cached = _load_cached(workshop_id, language)
-            if not cached:
-                return
+                # 到这里: 要么 fetch_reason!="ok"（临时失败），要么 fetch_reason=="ok"
+                # 但社区 HTML 里确实没有中文 desc（作者没填 + 社区翻译系统也没覆盖）
+                cached = _load_cached(workshop_id, language)
+                if not cached:
+                    return
 
-            # 判断是不是临时失败（值得保留重试机会，不标记 html_checked=True）
-            # 临时: 熔断类、HTTP 错误、连接抖动、任意 exception（偶发异常按临时处理）
-            # 只有 fetch_reason=="ok" 但 HTML 里真没中文 → 唯一确认"没翻译"的路径
-            _TEMP_FAILURES = {"429_circuit", "403_circuit", "circuit_open", "connection", "exception"}
-            is_temp_failure = (
-                fetch_reason in _TEMP_FAILURES
-                or fetch_reason.startswith("http_")
-            )
+                # 判断是不是临时失败（值得保留重试机会，不标记 html_checked=True）
+                # 临时: 熔断类、HTTP 错误、连接抖动、任意 exception（偶发异常按临时处理）
+                # 只有 fetch_reason=="ok" 但 HTML 里真没中文 → 唯一确认"没翻译"的路径
+                _TEMP_FAILURES = {"429_circuit", "403_circuit", "circuit_open", "connection", "exception"}
+                is_temp_failure = (
+                    fetch_reason in _TEMP_FAILURES
+                    or fetch_reason.startswith("http_")
+                )
 
-            if is_temp_failure:
-                cached["html_last_checked_ts"] = time.time()
-                cached.pop("html_checked", None)  # 删掉 → 下次还能进预判层
-                _save_cache(workshop_id, cached, None, "image/jpeg")
-                _log.warning("[workshop] wid=%s HTML 临时失败 (reason=%s) → 不标记已检查，保留重试机会",
-                             workshop_id, fetch_reason)
-            else:
-                # 正常情况：社区真没中文 desc 或 HTML 解析失败 → 标记已检查
-                cached["html_checked"] = True
-                cached["html_time_updated"] = check_time
-                cached["html_last_checked_ts"] = time.time()
-                _save_cache(workshop_id, cached, None, "image/jpeg")
-                _log.debug("[workshop] wid=%s 后台 HTML 未拿到中文 desc（已标记跳过, reason=%s）",
-                           workshop_id, fetch_reason)
-        except Exception as e:
-            _log.debug("[workshop] wid=%s 后台 HTML 补全失败: %s", workshop_id, e)
-        finally:
-            with _html_lock:
-                _html_inflight.discard(workshop_id)
+                if is_temp_failure:
+                    cached["html_last_checked_ts"] = time.time()
+                    cached.pop("html_checked", None)  # 删掉 → 下次还能进预判层
+                    _save_cache(workshop_id, cached, None, "image/jpeg")
+                    _log.warning("[workshop] wid=%s HTML 临时失败 (reason=%s) → 不标记已检查，保留重试机会",
+                                 workshop_id, fetch_reason)
+                else:
+                    # 正常情况：社区真没中文 desc 或 HTML 解析失败 → 标记已检查
+                    cached["html_checked"] = True
+                    cached["html_time_updated"] = check_time
+                    cached["html_last_checked_ts"] = time.time()
+                    _save_cache(workshop_id, cached, None, "image/jpeg")
+                    _log.debug("[workshop] wid=%s 后台 HTML 未拿到中文 desc（已标记跳过, reason=%s）",
+                               workshop_id, fetch_reason)
+            except Exception as e:
+                _log.debug("[workshop] wid=%s 后台 HTML 补全失败: %s", workshop_id, e)
+            finally:
+                with _html_lock:
+                    _html_inflight.discard(workshop_id)
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -671,8 +675,7 @@ def fetch_workshop_dependencies(workshop_id: str, timeout: int = 15) -> Optional
         if time.time() - fetched_at < _DEPS_CACHE_TTL:
             return cached["dependencies"]
 
-    # HTML 爬取（唯一保留场景）
-    _deps_throttle()
+    # HTML 爬取（唯一保留场景）—— throttle 统一在 _fetch_html 内部
     html_text, _ = _fetch_html(wid)
     if html_text is None:
         return None

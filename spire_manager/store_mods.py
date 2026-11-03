@@ -1695,7 +1695,7 @@ class ModManager:
                 _log.warning("[ws-deps] 爬 %s 失败: %s", wid, e)
                 return wid, None
 
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="ws-deps") as ex:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ws-deps") as ex:
             futures = {ex.submit(_fetch_item, t): t for t in to_fetch}
             for fut in as_completed(futures):
                 wid, ws_deps = fut.result()
