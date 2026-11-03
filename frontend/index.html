@@ -1,0 +1,1025 @@
+﻿<!-- ============================================================
+  Spire Mod Manager — 前端模板 (Vue 3 Options-style, 零构建)
+  布局: 顶栏 + 四栏面板 (预览 | 停用列表 | 启用列表 | 整合包/皮肤/卡面/备份)
+  设计稿: 即时设计 (js.design)
+  改 UI 只动 class + style.css，逻辑在 app.js
+  ============================================================ -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="pragma" content="no-cache" />
+  <meta http-equiv="expires" content="0" />
+  <title>Spire Mod Manager</title>
+  <link rel="stylesheet" href="style.css?v=20261103c" />
+</head>
+<body>
+  <div id="app">
+    <!-- ============== 顶栏：logo + 游戏版本/Beta分支 + 设置/存档按钮 ============== -->
+    <header class="topbar">
+      <div class="logo">Spire Mod Manager</div>
+
+      <!-- 游戏版本徽章（简洁） -->
+      <div class="topbar-game-info">
+        <template v-if="gameInfo">
+          <span class="game-version-badge version-detected" v-if="gameInfo.version_detected">v{{ gameInfo.version }}</span>
+          <span v-else class="game-version-badge version-unknown">{{ t('game_version_unknown') }}</span>
+          <span class="beta-current-label">{{ gameInfo.beta_label || gameInfo.beta_key || (gameInfo.version_detected ? 'public' : '') }}</span>
+        </template>
+        <span v-else class="game-version-badge version-unknown">{{ t('game_version_unknown') }}</span>
+        <button class="btn-ghost btn-saves" @click="openSavesManager">💾 {{ t('saves_manager') }}</button>
+      </div>
+
+      <div class="topbar-spacer"></div>
+      <button class="btn-ghost" @click="openSettings">⚙ {{ t('settings') }}</button>
+    </header>
+
+    <!-- 右上角悬浮提示 -->
+    <div class="toast-container">
+      <div v-for="t in toasts" :key="t.id" class="toast">{{ t.text }}</div>
+    </div>
+
+    <!-- 右上角预览下载进度条 -->
+    <div class="corner-progress-container">
+      <div v-if="previewProgress.show" class="corner-progress">
+        <div class="corner-progress-text">{{ previewProgress.name }}</div>
+        <div class="corner-progress-track">
+          <div class="corner-progress-fill" :style="{ width: previewProgress.percent + '%' }"></div>
+        </div>
+      </div>
+      <div v-if="bulkProgress.show" class="corner-progress">
+        <div class="corner-progress-text">{{ t('bulk_downloading_soft') }}</div>
+        <div class="corner-progress-track">
+          <div class="corner-progress-fill" :style="{ width: bulkProgress.total ? (bulkProgress.done / bulkProgress.total * 100) + '%' : '0%' }"></div>
+        </div>
+      </div>
+      <div v-if="backupBusy.show" class="corner-progress">
+        <div class="corner-progress-text">{{ backupBusy.text }}</div>
+        <div class="corner-progress-track">
+          <div class="corner-progress-fill indeterminate"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DLL 分析进度条（中下方） -->
+    <div v-if="dllProgress.show" class="dll-progress-bar">
+      <div class="dll-progress-text">{{ dllProgress.current ? dllProgress.current + ' ' + t('analyzing') : t('analyzing_dll') }}</div>
+      <div class="dll-progress-track">
+        <div class="dll-progress-fill" :style="{ width: dllProgress.total ? (dllProgress.done / dllProgress.total * 100) + '%' : '0%' }"></div>
+      </div>
+    </div>
+
+    <!-- 扫描进度条（中下方） -->
+    <div v-if="scanProgress.show" class="dll-progress-bar scan-progress-bar">
+      <div class="dll-progress-text">{{ t({ fetch_deps: 'scan_stage_deps', finalize: 'scan_stage_finalize' }[scanProgress.stage] || 'scanning') }} {{ scanProgress.current }}</div>
+      <div class="dll-progress-track">
+        <div class="dll-progress-fill scan-progress-fill" :style="{ width: scanProgress.total ? (scanProgress.done / scanProgress.total * 100) + '%' : '0%' }"></div>
+      </div>
+    </div>
+
+    <!-- 后台快速预览图进度（全局底部，启动后自动跑一次） -->
+    <div v-if="bgProgress.show" class="dll-progress-bar bg-progress-bar">
+      <div class="dll-progress-text">
+        <span v-if="bgProgress.phase1.total < 0">{{ t('bg_fill_preparing') }}</span>
+        <span v-else-if="bgProgress.phase1.running">{{ t('bg_fill_phase1') }} {{ bgProgress.phase1.done }}/{{ bgProgress.phase1.total }}</span>
+        <span v-else>{{ t('bg_fill_done') }} {{ bgProgress.phase1.done }}/{{ Math.max(bgProgress.phase1.total, 0) }}</span>
+      </div>
+      <div class="dll-progress-track">
+        <div v-if="bgProgress.phase1.total < 0" class="dll-progress-fill indeterminate"></div>
+        <div v-else class="dll-progress-fill bg-phase1" :style="{ width: (bgProgress.phase1.total > 0 ? (bgProgress.phase1.done / bgProgress.phase1.total * 100) : 0) + '%' }"></div>
+      </div>
+    </div>
+
+    <!-- 工坊订阅登记读取失败提示（FIX-6） -->
+    <div v-if="state.subscribed_known === false" class="subscribed-warn">
+      ⚠ {{ t('subscribed_unknown_hint') }}
+    </div>
+
+    <!-- ============== 四栏主面板 ============== -->
+    <main class="panels">
+      <!-- 栏1: Mod 详情预览卡 (最大，在中间偏左) -->
+      <section class="card preview-card">
+        <div class="card-title">{{ t('preview_title') }}</div>
+        <div class="preview-body">
+          <!-- ============ 1) 预览图固定区（始终渲染，无图显示占位） ============ -->
+          <div class="ws-gallery">
+            <template v-if="effectivePreview">
+              <img class="ws-preview" :src="effectivePreview" :alt="t('promo_image')" />
+            </template>
+            <template v-else>
+              <div class="ws-preview-placeholder">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <rect x="3" y="3" width="18" height="18" rx="2" />
+                  <circle cx="8.5" cy="8.5" r="1.5" />
+                  <path d="M21 15l-5-5L5 21" />
+                </svg>
+                <span>无预览图</span>
+              </div>
+            </template>
+          </div>
+
+          <!-- ============ 2) 下方滚动区 ============ -->
+          <div class="preview-scroll">
+            <!-- 没选中时的空状态 -->
+            <div v-if="!selected" class="preview-empty">{{ t('select_hint') }}</div>
+
+            <!-- ============ 2a) Mod 信息 ============ -->
+              <template v-else>
+                <div class="preview-head">
+                  <div class="preview-title"
+                       :class="{ 'click-copy': selected }"
+                       :title="selected ? t('click_to_copy') : ''"
+                       @click="selected && copyText(selected.name)">
+                    {{ selected ? selected.name : t('not_selected') }}
+                  </div>
+                  <!-- 作者/版本/工坊ID 三小卡片 -->
+                  <div class="meta-cards">
+                    <div class="meta-card" v-if="selected && selected.author">
+                      <span class="meta-ic">👤</span><span class="meta-val">{{ selected.author }}</span>
+                    </div>
+                    <div class="meta-card" v-if="selected && selected.version">
+                      <span class="meta-ic">📦</span><span class="meta-val">v{{ selected.version }}</span>
+                    </div>
+                    <div class="meta-card" v-if="selected && selected.workshop_id">
+                      <span class="meta-ic">🎮</span><span class="meta-val">工坊 #{{ selected.workshop_id }}</span>
+                    </div>
+                  </div>
+                </div>
+
+              <!-- ============ 2b) 分类容器（工坊标签 + 模组标签 两个分组） ============ -->
+              <div class="tags-card">
+                <div class="tags-group">
+                  <div class="tags-group-title">🏷 {{ t('tags_workshop') || '工坊标签' }}</div>
+                  <!-- 工坊标签：只来自 Steam Workshop API 返回的 workshop.data.tags，不含 manager/hit -->
+                  <div v-if="(workshop.data && workshop.data.tags && workshop.data.tags.length)" class="ws-tags">
+                    <span v-for="tag in workshop.data.tags" :key="'ws-'+tag" class="ws-tag click-copy" :title="t('click_to_copy')" @click="copyText(tr(tag))">{{ tr(tag) }}</span>
+                  </div>
+                  <div v-else class="tags-empty">{{ t('no_tags') || '无' }}</div>
+                </div>
+                <div class="tags-group">
+                  <div class="tags-group-title">📌 {{ t('tags_mod_local') || '自定义标签' }}</div>
+                  <div v-if="selectedManagerTags.length" class="ws-tags">
+                    <!-- workshop 来源：白色无背景（Steam 社区标签映射） -->
+                    <span v-for="item in selectedManagerTags.filter(x => x.source === 'workshop')"
+                          :key="'ws-src-'+item.tag"
+                          class="ws-tag ws-source-tag click-copy"
+                          :title="'来源: Steam 社区标签（' + (selected?.tag_reason || '') + '）'"
+                          @click="copyText(tr(item.tag))">
+                      🌐 {{ tr(item.tag) }}
+                    </span>
+                    <!-- manual / local 来源：深色背景 + 可点击修改 -->
+                    <span v-for="item in selectedManagerTags.filter(x => x.source !== 'workshop')"
+                          :key="'custom-'+item.tag"
+                          class="ws-tag manager-tag click-copy"
+                          :class="{ 'manual-tag': item.source === 'manual', 'local-tag': item.source === 'local' }"
+                          :title="item.source === 'manual' ? '来源: 用户手动设置（点击可修改）' : '来源: 管理器自动识别（点击可修改）'"
+                          @click="menu.mod = selected; openTagMenu()">
+                      {{ tr(item.tag) }}
+                    </span>
+                  </div>
+                  <div v-else class="tags-empty">{{ t('no_tags') || '无' }}</div>
+                </div>
+              </div>
+
+              <!-- ============ 2c) 前置依赖列表（只在启用态 mod 选中时显示） ============ -->
+              <div v-if="selected && selected.is_enabled !== false && selected.dependencies && selected.dependencies.length" class="dep-block">
+                <div class="dep-block-title">📦 {{ t('deps_label') }}</div>
+                <div class="dep-list">
+                  <div v-for="ds in selected.dep_statuses" :key="ds.id" class="dep-row" :class="ds.status">
+                    <span class="dep-icon">{{ ds.status === 'ok' ? '🟢' : ds.status === 'missing_enable' ? '🟡' : '🔴' }}</span>
+                    <span class="dep-name">{{ ds.id }}</span>
+                    <span class="dep-label">{{ t('dep_status_' + ds.status, { name: ds.id }) }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ============ 2d) 个人编辑：别名 / 备注 / 颜色 / 锁定 ============ -->
+              <div class="p0-edit-panel">
+                <div class="p0-edit-row">
+                  <label class="p0-edit-label">别名</label>
+                  <input class="p0-edit-input" :value="selected.mod_meta && selected.mod_meta.alias || ''" @input="setAlias($event)" placeholder="可选：给它起个自己叫的名字" />
+                </div>
+                <div class="p0-edit-row">
+                  <label class="p0-edit-label">备注</label>
+                  <textarea class="p0-edit-textarea" :value="selected.mod_meta && selected.mod_meta.note || ''" @input="setNote($event)" placeholder="可选：为什么装这个 mod" rows="2"></textarea>
+                </div>
+                <div class="p0-edit-row">
+                  <label class="p0-edit-label">颜色</label>
+                  <input class="p0-edit-color" type="color" :value="selected.mod_color || '#3498db'" @input="setColor($event)" />
+                  <button class="p0-edit-clear" @click="setColor(null)">清除</button>
+                </div>
+                <div class="p0-edit-row pinned-control">
+                  <label class="p0-edit-label">锁定</label>
+                  <label class="p0-check">
+                    <input type="checkbox" v-if="selected" :checked="!!selected.pinned" @change="togglePin('version')" />
+                    <span v-if="selected.pinned">已锁版本 {{ selected.pinned.version || '' }}</span>
+                    <span v-else>🔒 锁定此 mod（防止意外停用/更新）</span>
+                  </label>
+                  <button v-if="selected && selected.pinned" class="p0-edit-clear" @click="togglePin('unpin')">🔓 解锁</button>
+                </div>
+              </div>
+
+              <!-- ============ 2e) Mod 介绍 ============ -->
+              <!-- workshop loading/error 提示（保留，方便知道在线状态） -->
+              <div v-if="workshop.loading" class="ws-loading">{{ t('ws_loading') }}</div>
+              <div v-else-if="workshop.error" class="ws-error">{{ t('ws_error') }}{{ workshop.error }}</div>
+              <!-- Per-field fallback：workshop 描述有效才用，否则退回本地 manifest，最后用带依赖信息的 selectedDesc 兜底 -->
+              <div v-if="effectiveDescription" class="ws-desc" v-html="effectiveDescription"></div>
+              <div v-else-if="selectedDesc" class="preview-desc">{{ selectedDesc }}</div>
+
+              <!-- 打开工坊详情按钮（保留，方便跳转） -->
+              <button v-if="selected && selected.workshop_id" class="ws-link ws-open-btn" @click="openWsMenu($event)">{{ t('open_details') }}</button>
+            </template>
+          </div>
+        </div>
+      </section>
+
+      <!-- 「打开详情」菜单（向上展开） -->
+      <div v-if="wsMenu.show" class="context-menu ws-menu" :style="{ left: wsMenu.x + 'px', top: wsMenu.y + 'px' }">
+        <div class="menu-item" @click="openWorkshop('browser')">{{ t('open_browser') }}</div>
+        <div class="menu-item" @click="openWorkshop('steam')">{{ t('open_steam') }}</div>
+      </div>
+
+      <!-- 栏2: 停用 Mod 列表 (左) -->
+      <section class="card">
+        <div class="card-title"><span></span>{{ t('disabled_title') }}</span><span class="mod-count">{{ displayList([], 'disabled', disabledSearch).length }}</span></div>
+        <div class="mod-breakdown" v-if="breakdown && breakdown.workshop_dirs_total > 0">
+          扫描 {{ breakdown.workshop_dirs_total }} 个工坊目录
+          <template v-if="breakdown.unsubscribed_skipped > 0">
+            · 跳过 {{ breakdown.unsubscribed_skipped }} 个未订阅残留
+          </template>
+          <template v-if="breakdown.native_list_total > 0">
+            · settings.save {{ breakdown.native_list_total }} 条
+          </template>
+          <template v-if="breakdown.merged_duplicate_sources > 0">
+            · {{ breakdown.merged_duplicate_sources }} 个合并重复源
+          </template>
+          <span class="breakdown-total">→ 显示 {{ breakdown.final_total }} 个</span>
+        </div>
+        <div class="search-row">
+          <input v-model="disabledSearch" :placeholder="t('search_disabled')" class="search-input" />
+        </div>
+        <ul class="mod-list disabled-mod-list">
+          <li v-for="m in displayList(filteredDisabled, 'disabled', disabledSearch)" :key="'d-'+m.__version_key"
+              class="mod-item disabled-item"
+              :data-ver-key="m.__version_key"
+              :class="{ selected: selected && selected.__version_key === m.__version_key }"
+              @click="select(m, 'disabled')"
+              @dblclick="dblClickHandler(m)"
+              @contextmenu.prevent="openMenu($event, m)"
+              :title="m.install_path || ''">
+            <div class="mod-title" :style="m.mod_color ? { color: m.mod_color } : {}">
+                  <span class="drag-grip" title="拖到右侧启用 / 拖动"
+                        @pointerdown.stop="onDragStart($event, -1, m, 'disabled')">
+                    <span class="mod-type-icon" :title="m.mod_type_label">{{ m.mod_type_icon }}</span>
+                    <span class="source-badge" :class="'src-'+(m.external_source || m.source)" :title="m.source_label">{{ m.source_label }}</span>
+                  </span>
+                  <span v-if="m.pinned" class="pinned-badge" :title="'已锁定: ' + (m.pinned.version || '')">{{ m.pinned.enabled !== undefined ? (m.pinned.enabled ? '📌' : '🆘') : '📌' }}</span>
+                  {{ m.name }}
+                </div>
+            <div class="mod-sub">{{ subText(m) }}</div>
+          </li>
+        </ul>
+      </section>
+
+      <!-- 栏3: 启用 Mod 列表 (右) — 含 SVG 依赖线层 + 拖拽 placeholder -->
+      <section class="card">
+        <div class="card-title"><span>{{ t('enabled_title') }}</span><span class="mod-count">{{ displayList([], 'enabled', enabledSearch).length }}</span></div>
+        <div class="mod-breakdown" v-if="breakdown && breakdown.workshop_dirs_total > 0">
+          启用 {{ breakdown.final_enabled }} / 停用 {{ breakdown.final_disabled }} · 合并重复源 {{ breakdown.merged_duplicate_sources }} 个
+        </div>
+        <div class="search-row">
+          <input v-model="enabledSearch" :placeholder="t('search_enabled')" class="search-input" />
+        </div>
+        <div class="enabled-list-wrap">
+          <svg class="dep-layer" :width="DEP_AREA" :height="depHeight" :style="depStyle" ref="depLayer"></svg>
+          <!-- 拖拽指示线：一条横线显示 drop 位置，不挤开列表 -->
+          <div v-if="indicatorStyle" class="drag-indicator" :style="indicatorStyle"></div>
+          <ul class="mod-list enabled-list" @scroll="onDepScroll" ref="enabledListRef">
+            <li v-for="(m, idx) in dragRenderList"
+                :key="m.__version_key"
+                class="mod-item"
+                :data-id="m.id"
+                :data-ver-key="m.__version_key"
+                :class="{
+                  selected: selected && selected.__version_key === m.__version_key,
+                  'warn-item': m.has_dep_warning,
+                  dragging: drag.active && drag.fromMod && drag.fromMod.__version_key === m.__version_key,
+                  'dup-warn': m.dep_flags && m.dep_flags.includes('dup_warn'),
+                }"
+                :style="m.mod_color ? { color: m.mod_color } : {}"
+                @click="select(m, 'enabled')"
+                @dblclick="dblClickHandler(m)"
+                @contextmenu.prevent="openMenu($event, m)"
+                :title="m.install_path || ''">
+              <div class="mod-title">
+                  <span class="drag-grip" title="拖动排序 / 拖回左侧停用"
+                        @pointerdown.stop="onDragStart($event, idx, m, 'enabled')">
+                    <span class="mod-type-icon" :title="m.mod_type_label">{{ m.mod_type_icon }}</span>
+                    <span class="source-badge" :class="'src-'+(m.external_source || m.source)" :title="m.source_label">{{ m.source_label }}</span>
+                    <span v-if="m.pinned" class="pinned-badge" :title="'已锁定: ' + (m.pinned.version || '')">{{ m.pinned.enabled !== undefined ? (m.pinned.enabled ? '📌' : '🆘') : '📌' }}</span>
+                  </span>
+                  {{ m.name }}
+                </div>
+                <div class="mod-sub">{{ subText(m) }}</div>
+                <span v-if="m.has_dep_warning || (m.dep_flags && m.dep_flags.includes('dup_warn'))"
+                      class="item-warn-icon"
+                      :title="depWarnTitle(m)">⚠</span>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 栏4: 整合包 / 皮肤 / 卡面 / 备份 (Tab 切换) -->
+      <section class="card pack-card">
+        <div class="pack-tabs">
+          <button class="pack-tab" :class="{ active: packTab === 'packs' }" @click="packTab = 'packs'">{{ t('packs_tab') }}</button>
+          <button class="pack-tab" :class="{ active: packTab === 'skins' }" @click="packTab = 'skins'">{{ t('skins_tab') }}</button>
+          <button class="pack-tab" :class="{ active: packTab === 'cards' }" @click="packTab = 'cards'">{{ t('cards_tab') }}</button>
+          <button class="pack-tab" :class="{ active: packTab === 'backups' }" @click="packTab = 'backups'">{{ t('backups_tab') }}</button>
+        </div>
+
+        <!-- 整合包页签 -->
+        <template v-if="packTab === 'packs'">
+          <ul v-if="state.packs.length" class="pack-list">
+            <li v-for="p in state.packs" :key="p.id"
+                class="pack-item"
+                @dblclick="loadPack(p)"
+                @contextmenu.prevent="openPackMenu($event, p)">
+              <div class="pack-name">{{ p.name }}</div>
+              <div class="pack-time">{{ p.created_at }}</div>
+            </li>
+          </ul>
+          <div v-else class="pack-placeholder">{{ t('no_packs') }}</div>
+        </template>
+
+        <!-- 皮肤管理页签 -->
+        <template v-else-if="packTab === 'skins'">
+          <div v-if="!skin.config_found" class="skin-config-hint">{{ t('skin_no_config_hint') }}</div>
+          <div v-if="skin.roles.length === 0" class="pack-placeholder">{{ t('no_skins_detected') }}</div>
+          <div v-else class="skin-list">
+            <div v-for="role in skin.roles" :key="role.id" class="skin-role">
+              <div class="skin-role-name">{{ tr(role.label) }}<span v-if="role.is_character" class="char-badge">{{ t('char_mod_badge') }}</span></div>
+              <template v-if="role.is_character && role.variants.length <= 1">
+                <div class="skin-char-only">{{ t('default_skin_char') }}</div>
+              </template>
+              <template v-else>
+                <label v-for="v in role.variants" :key="v.id" class="skin-variant">
+                  <input type="radio" :name="'skin-' + role.id" :value="v.id"
+                         :checked="role.active === v.id"
+                         @change="setSkinActive(role.id, v.id)" />
+                  <span>{{ v.is_default ? t('default_skin') : v.label }}</span>
+                  <span v-if="role.active === v.id" class="skin-active-mark">✓</span>
+                </label>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <!-- 卡面管理页签 -->
+        <template v-else-if="packTab === 'cards'">
+          <div v-if="!card.config_found" class="skin-config-hint">{{ t('skin_no_config_hint') }}</div>
+          <div v-if="card.roles.length === 0" class="pack-placeholder">{{ t('no_cards_detected') }}</div>
+          <div v-else class="skin-list">
+            <div v-for="role in card.roles" :key="role.id" class="skin-role">
+              <div class="skin-role-name">{{ tr(role.label) }}<span v-if="role.is_character" class="char-badge">{{ t('char_mod_badge') }}</span></div>
+              <template v-if="role.is_character && role.variants.length <= 1">
+                <div class="skin-char-only">{{ t('default_card_char') }}</div>
+              </template>
+              <template v-else>
+                <label v-for="v in role.variants" :key="v.id" class="skin-variant">
+                  <input type="radio" :name="'card-' + role.id" :value="v.id"
+                         :checked="role.active === v.id"
+                         @change="setCardActive(role.id, v.id)" />
+                  <span>{{ v.is_default ? t('default_card') : v.label }}</span>
+                  <span v-if="role.active === v.id" class="skin-active-mark">✓</span>
+                </label>
+              </template>
+            </div>
+          </div>
+        </template>
+
+        <!-- 备份页签 -->
+        <template v-else>
+          <div class="backup-stats">
+            <span class="backup-stat">{{ t('backup_count', { n: state.backups.length }) }}</span>
+            <span class="backup-stat">{{ t('backup_size') }} {{ fmtBytes((state.backup_stats || {}).archive_bytes) }}</span>
+            <span v-if="(state.backup_stats || {}).saved_bytes" class="backup-stat ok">{{ t('backup_saved_label') }} {{ fmtBytes(state.backup_stats.saved_bytes) }}</span>
+            <div class="btn-spacer"></div>
+            <button class="btn btn-icon" :title="t('open_backup_dir')" @click="openBackupFolder('')">📂</button>
+          </div>
+          <ul v-if="state.backups.length" class="pack-list backup-list">
+            <li v-for="b in state.backups" :key="b.id"
+                class="pack-item backup-item"
+                :class="{ 'backup-missing': !b.exists }"
+                @dblclick="openRestore(b)"
+                @contextmenu.prevent="openBackupMenu($event, b)">
+              <div class="backup-main">
+                <span class="source-badge" :class="'src-'+backupSrcClass(b)">{{ b.source_label || '工坊' }}</span>
+                <span class="backup-name" :title="b.name">{{ b.name }}</span>
+                <span v-if="b.version" class="backup-ver">v{{ b.version }}</span>
+                <span v-if="b.kind === 'auto'" class="backup-kind">{{ '自动' }}</span>
+              </div>
+              <div class="pack-time">
+                {{ b.created_at }} · {{ fmtBytes(b.original_bytes) }} → {{ fmtBytes(b.archive_bytes) }}
+                <span v-if="!b.exists" class="backup-warn">· 归档缺失</span>
+              </div>
+            </li>
+          </ul>
+          <div v-else class="pack-placeholder">{{ t('no_backups') }}</div>
+        </template>
+
+        <!-- 操作按钮（独立于页签，始终显示） -->
+        <div v-if="packTab !== 'backups'" class="btn-row">
+          <button class="btn" @click="scan">{{ t('scan') }}</button>
+          <button class="btn" @click="autoSort">{{ t('sort') }}</button>
+          <button class="btn" @click="save">{{ t('save') }}</button>
+          <button class="btn btn-icon" :title="t('log_tip')" @click="openLogDiag">🩺</button>
+          <div class="btn-spacer"></div>
+          <!-- P0: 导出按钮 -->
+          <button class="btn btn-icon" title="导出 CSV" @click="doExport('csv')">📋</button>
+          <button class="btn btn-icon" title="导出 Markdown" @click="doExport('markdown')">📝</button>
+        </div>
+        <div v-if="packTab !== 'backups'" class="btn-row">
+          <button class="btn btn-icon" :title="t('clear_enabled_tip')" @click="clearEnabled">🔄</button>
+          <!-- P0: Steam ID 显示 -->
+          <span v-if="state.steam_id" class="steam-id-badge" :title="'当前写入 settings.save 的账号: ' + state.steam_id">{{ state.steam_id }}</span>
+          <button class="btn btn-launch" @click="launch">{{ launchText }}</button>
+        </div>
+        <!-- 备份页签专用按钮 -->
+        <div v-if="packTab === 'backups'" class="btn-row">
+          <button class="btn" @click="backupAll('enabled')">{{ t('backup_btn_enabled') }}</button>
+          <button class="btn btn-launch" @click="backupAll('all')">{{ t('backup_btn_all') }}</button>
+          <div class="btn-spacer"></div>
+          <button class="btn" @click="openBackupFolder('')">{{ t('open_backup_dir') }}</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- 整合包右键菜单 -->
+    <div v-if="packMenu.show" ref="packMenuEl" class="context-menu pack-menu" :style="{ left: packMenu.x + 'px', top: packMenu.y + 'px' }">
+      <div class="menu-item" @click="loadPack(packMenu.pack)">{{ t('load') }}</div>
+      <div class="menu-sep"></div>
+      <div class="menu-item" @click="sharePack">{{ t('share') }}</div>
+      <div class="menu-item" @click="renamePack">{{ t('rename') }}</div>
+      <div class="menu-item danger" @click="deletePack">{{ t('delete') }}</div>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div v-if="menu.show" ref="menuEl" class="context-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }">
+      <template v-if="menu.versions.length > 1">
+        <div class="menu-label">定位其它版本</div>
+        <div v-for="v in menu.versions" :key="v.key" class="menu-item" @click="locateVersion(v.key)">
+          {{ versionLabel(v) }}
+        </div>
+      </template>
+      <template v-else>
+        <div class="menu-item disabled">定位其它版本（无）</div>
+      </template>
+      <div class="menu-sep"></div>
+      <div class="menu-item" @click="menuToggle">{{ menu.toggleText }}</div>
+      <div class="menu-item" @click="openTagMenu">{{ t('manage_tags') }}</div>
+      <div class="menu-item" :class="{ disabled: !menu.mod.workshop_id }" @click="refreshWsPreview">{{ t('refresh_preview') }}</div>
+      <div class="menu-item" :class="{ disabled: !menu.mod.path }" @click="backupMod(menu.mod)">{{ t('backup_this_mod') }}</div>
+      <div class="menu-item" :class="{ disabled: !menu.mod.path }" @click="openFolder">{{ t('open_folder') }}</div>
+      <div class="menu-item danger" :class="{ disabled: !menu.mod.path }" @click="deleteMod">{{ t('delete') }}</div>
+    </div>
+
+    <!-- 备份右键菜单 -->
+    <div v-if="backupMenu.show" ref="backupMenuEl" class="context-menu backup-menu" :style="{ left: backupMenu.x + 'px', top: backupMenu.y + 'px' }">
+      <div class="menu-item" :class="{ disabled: !backupMenu.backup.exists }" @click="openRestore(backupMenu.backup)">{{ t('restore_title') }}</div>
+      <div class="menu-item danger" @click="deleteBackup(backupMenu.backup)">{{ t('delete') }}</div>
+      <div class="menu-sep"></div>
+      <div class="menu-item" @click="verifyBackup(backupMenu.backup)">{{ t('verify_backup') }}</div>
+      <div class="menu-item" @click="openBackupFolder(backupMenu.backup.id)">{{ t('open_backup_dir') }}</div>
+    </div>
+
+    <!-- ============== 弹窗区 (Mod 菜单 / 还原 / 设置 / 标签管理 / 日志诊断 / 存档) ============== -->
+
+    <!-- 还原位置选择弹窗 -->
+    <div v-if="restoreDlg.show" class="modal-mask" @click.self="closeRestore">
+      <div class="modal restore-modal">
+        <div class="modal-header">
+          <h3>{{ t('restore_title') }} · {{ restoreDlg.backup ? restoreDlg.backup.name : '' }}</h3>
+          <button class="btn-close-modal" @click="closeRestore" :title="t('close')">✕</button>
+        </div>
+        <div class="restore-body">
+          <div class="settings-desc">{{ t('restore_choose') }}</div>
+          <button class="restore-option" :disabled="restoreDlg.busy" @click="confirmRestore('workshop')">
+            <div class="restore-option-title">{{ t('restore_to_workshop') }}</div>
+            <div class="restore-option-desc">{{ t('restore_to_workshop_desc') }}</div>
+          </button>
+          <button class="restore-option" :disabled="restoreDlg.busy" @click="confirmRestore('local')">
+            <div class="restore-option-title">{{ t('restore_to_local') }}</div>
+            <div class="restore-option-desc">{{ t('restore_to_local_desc') }}</div>
+          </button>
+        </div>
+        <div class="btn-row right">
+          <button class="btn" :disabled="restoreDlg.busy" @click="closeRestore">{{ t('close') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Steam 工坊更新弹窗 -->
+    <div v-if="updateDialog.show" class="modal-mask" @click.self="closeUpdateDialog">
+      <div class="modal update-modal">
+        <div class="modal-header">
+          <h3>🔔 工坊有 {{ workshopUpdates.updates.length }} 个模组可更新</h3>
+          <button class="btn-close-modal" @click="closeUpdateDialog" title="关闭">✕</button>
+        </div>
+        <div class="modal-body update-body">
+          <div class="update-hint">
+            STS2 无法通过命令行自动更新，请点击下方按钮打开 Steam 客户端工坊页面，
+            Steam 会自动下载更新。
+          </div>
+          <div class="update-list">
+            <div v-for="u in workshopUpdates.updates" :key="u.workshop_id" class="update-item">
+              <div class="update-item-top">
+                <span class="update-name">{{ u.name }}</span>
+                <span class="update-status" :class="u._backupStatus">{{
+                  u._backupStatus === 'ok' ? '✓ 已备份' :
+                  u._backupStatus === 'loading' ? '备份中…' :
+                  u._backupStatus === 'err' ? '备份失败' : ''
+                }}</span>
+              </div>
+              <div class="update-item-meta">
+                <span class="update-meta-label">工坊 ID:</span>
+                <span class="update-meta-val mono">{{ u.workshop_id }}</span>
+                <span class="update-meta-label">本地版本:</span>
+                <span class="update-meta-val mono">{{ fmtUnixTime(u.local_mtime) }}</span>
+              </div>
+              <div class="update-item-meta">
+                <span class="update-meta-label">Steam 最新:</span>
+                <span class="update-meta-val mono update-new">{{ fmtUnixTime(u.remote_updated) }}</span>
+                <template v-if="u.remote_revision > 0">
+                  <span class="update-meta-label">rev:</span>
+                  <span class="update-meta-val mono update-rev">#{{ u.remote_revision }}</span>
+                </template>
+                <template v-if="u.reason">
+                  <span class="update-meta-label">原因:</span>
+                  <span class="update-meta-val update-reason">{{ u.reason }}</span>
+                </template>
+              </div>
+              <div class="update-item-actions">
+                <button class="update-backup-btn" @click="backupOneUpdate(u)"
+                  :disabled="u._backupStatus === 'loading' || u._backupStatus === 'ok'">
+                  {{ u._backupStatus === 'ok' ? '已备份 ✓' : '先备份' }}
+                </button>
+                <button class="update-steam-btn" @click="openSteamWs(u.workshop_id)">
+                  打开 Steam 工坊 ↗
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <span class="update-stats" v-if="workshopUpdates.lastChecked">
+            上次检查: {{ workshopUpdates.lastChecked }}（{{ workshopUpdates.checked }} 个已检查，{{ workshopUpdates.errors }} 个错误）
+          </span>
+          <button class="btn" @click="closeUpdateDialog">知道了</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 设置对话框 -->
+    <div v-if="settings.show" class="modal-mask" @click.self="closeSettings">
+      <div class="modal settings-modal">
+        <div class="modal-header">
+          <h3>{{ t('settings') }}</h3>
+          <button class="btn-close-modal" @click="closeSettings" :title="t('close')">✕</button>
+        </div>
+        <div class="settings-body">
+          <!-- 左侧页签 -->
+          <div class="settings-tabs">
+            <button class="settings-tab" :class="{ active: settingsTab === 'game' }" @click="settingsTab = 'game'">🎮 {{ t('tab_game') || '游戏' }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'general' }" @click="settingsTab = 'general'">{{ t('tab_general') }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'paths' }" @click="settingsTab = 'paths'">{{ t('tab_paths') }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'cache' }" @click="settingsTab = 'cache'">{{ t('tab_cache') }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'backup' }" @click="settingsTab = 'backup'">{{ t('tab_backup') }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'analyze' }" @click="settingsTab = 'analyze'">{{ t('tab_analyze') }}</button>
+            <button class="settings-tab" :class="{ active: settingsTab === 'about' }" @click="settingsTab = 'about'">{{ t('tab_about') }}</button>
+          </div>
+
+          <!-- 右侧内容 -->
+          <div class="settings-content">
+            <template v-if="settingsTab === 'game'">
+              <div class="settings-section">
+                <div class="settings-section-title">🎮 {{ t('tab_game') || '游戏版本' }}</div>
+                <div class="settings-desc">{{ t('game_beta_desc') || '选择要启动的游戏分支。切换后 Steam 会后台下载更新。' }}</div>
+                <div v-if="gameInfo">
+                  <!-- 当前版本信息 -->
+                  <div class="game-current-info">
+                    <span class="gc-label">{{ t('game_current') || '当前' }}:</span>
+                    <span class="gc-name">
+                      {{ gameInfo.beta_label || gameInfo.beta_key || 'public' }}
+                      <span class="gc-version" v-if="gameInfo.version_detected">(v{{ gameInfo.version }})</span>
+                    </span>
+                    <!-- 下载中进度条 -->
+                    <span v-if="appUpdateStatus && appUpdateStatus.is_downloading" class="gc-downloading">
+                      下载中 {{ appUpdateStatus.progress }}%
+                    </span>
+                    <button class="gc-refresh-btn" @click="refreshGameVersion" title="刷新版本状态">🔄</button>
+                  </div>
+                  <!-- 下载进度条 -->
+                  <div v-if="appUpdateStatus && appUpdateStatus.is_downloading" class="download-progress">
+                    <div class="progress-bar">
+                      <div class="progress-fill" :style="{ width: appUpdateStatus.progress + '%' }"></div>
+                    </div>
+                    <span class="progress-text">
+                      {{ (appUpdateStatus.bytes_downloaded / 1048576).toFixed(0) }} MB
+                      / {{ (appUpdateStatus.bytes_to_download / 1048576).toFixed(0) }} MB
+                    </span>
+                  </div>
+                  <!-- Steam BETAS 风格分支列表 -->
+                  <div class="beta-list">
+                    <div v-for="br in (gameInfo.beta_list || [{key:'public', label:'public'}, {key:'public-beta', label:'public-beta'}])"
+                         :key="br.key"
+                         class="beta-item"
+                         :class="{ active: gameInfo.beta_key === br.key || (!gameInfo.beta_key && br.key === 'public'), disabled: betaSwitching }"
+                         @click="!betaSwitching && setAppBeta(br.key)">
+                      <span class="beta-radio">
+                        <span class="radio-inner" v-if="gameInfo.beta_key === br.key || (!gameInfo.beta_key && br.key === 'public')"></span>
+                      </span>
+                      <div class="beta-info">
+                        <div class="beta-name">{{ br.label || br.key }}</div>
+                        <div class="beta-desc" v-if="br.key === 'public'">{{ t('beta_public_desc') || '最新稳定版，推荐普通玩家使用' }}</div>
+                        <div class="beta-desc" v-else-if="br.key === 'public-beta'">{{ t('beta_public_beta_desc') || '公开测试版，包含实验性改动，可能不稳定' }}</div>
+                      </div>
+                      <span class="beta-current-tag" v-if="gameInfo.beta_key === br.key || (!gameInfo.beta_key && br.key === 'public')">{{ t('beta_current_tag') || '当前' }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="settings-desc">{{ t('game_not_detected') || '未检测到游戏，请先在"路径"页配置游戏目录' }}</div>
+              </div>
+            </template>
+
+            <template v-if="settingsTab === 'general'">
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('lang_title') }}</div>
+                <div class="settings-desc">{{ t('lang_desc') }}</div>
+                <div class="lang-options">
+                  <button class="lang-btn" :class="{ active: settings.form.language === 'zh' }" @click="settings.form.language = 'zh'">{{ t('lang_zh') }}</button>
+                  <button class="lang-btn" :class="{ active: settings.form.language === 'en' }" @click="settings.form.language = 'en'">{{ t('lang_en') }}</button>
+                </div>
+              </div>
+              <div class="btn-row right">
+                <button class="btn btn-launch" @click="saveSettings">{{ t('save') }}</button>
+              </div>
+            </template>
+
+            <template v-else-if="settingsTab === 'paths'">
+              <label>{{ t('root_dir') }}</label>
+              <div class="path-row">
+                <input v-model="settings.form.manual_game_root" :placeholder="t('ph_game_root')" />
+                <button class="btn" @click="pickFolder('manual_game_root')">{{ t('browse') }}</button>
+              </div>
+              <label>{{ t('workshop_dir') }}</label>
+              <div class="path-row">
+                <input v-model="settings.form.manual_workshop_dir" :placeholder="t('ph_workshop')" />
+                <button class="btn" @click="pickFolder('manual_workshop_dir')">{{ t('browse') }}</button>
+              </div>
+              <label>{{ t('mods_dir') }}</label>
+              <div class="path-row">
+                <input v-model="settings.form.manual_mods_dir" :placeholder="t('ph_mods')" />
+                <button class="btn" @click="pickFolder('manual_mods_dir')">{{ t('browse') }}</button>
+              </div>
+              <label>{{ t('save_dir') }}</label>
+              <div class="path-row">
+                <input v-model="settings.form.manual_save_dir" :placeholder="t('ph_save')" />
+                <button class="btn" @click="pickFolder('manual_save_dir')">{{ t('browse') }}</button>
+              </div>
+              <div class="btn-row right">
+                <button class="btn" @click="detectPaths">{{ t('auto_detect') }}</button>
+                <button class="btn btn-launch" @click="saveSettings">{{ t('save') }}</button>
+              </div>
+            </template>
+
+            <template v-else-if="settingsTab === 'cache'">
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('cache_update_title') }}</div>
+                <div class="settings-desc">{{ t('cache_update_desc') }}</div>
+                <button class="btn" @click="clearWorkshopCache">{{ t('cache_update_btn') }}</button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">🔁 {{ t('replacement_title') || '替代 Mod 建议' }}</div>
+                <div class="settings-desc">{{ t('replacement_desc') || '分析已装的工坊 mod：标记长期停更 + 订阅数低的，在同标签的已装 mod 里找订阅数更高且最近更新的替代者。纯本地分析，零网络请求。' }}</div>
+                <div v-if="replacementSuggestions.note === 'ok' && replacementSuggestions.suggestions.length" class="replacement-list">
+                  <div v-for="(s, i) in replacementSuggestions.suggestions" :key="i" class="replacement-item">
+                    <div class="replacement-old">
+                      <span class="repl-label">停用</span>
+                      <span class="repl-name">{{ s.replace.name }}</span>
+                      <span class="repl-meta">停更 {{ s.replace.idle_days }} 天 · ⭐{{ s.replace.subscriptions }}</span>
+                    </div>
+                    <div class="replacement-arrow">→</div>
+                    <div class="replacement-new">
+                      <span class="repl-label good">改用</span>
+                      <span class="repl-name">{{ s.with.name }}</span>
+                      <span class="repl-meta">⭐{{ s.with.subscriptions }} · 标签重叠 {{ s.with.tags_overlap }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else-if="replacementSuggestions.lastChecked" class="settings-desc muted">
+                  {{ replacementSuggestions.note === 'no_local_replacements' ? '已装 mod 里没有可替代的。' : replacementSuggestions.note === 'too_few_mods' ? '已装工坊 mod 太少（<2 个），无法对比。' : '无替代建议。' }}
+                  <span v-if="replacementSuggestions.scanned_count">（扫描了 {{ replacementSuggestions.scanned_count }} 个工坊 mod）</span>
+                </div>
+                <button class="btn" :disabled="replacementChecking" @click="findReplacementMods">
+                  {{ replacementChecking ? '分析中…' : (replacementSuggestions.lastChecked ? '重新分析' : '查找替代 Mod') }}
+                </button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">💾 {{ t('export_steamdb_title') || '导出 SteamDB' }}</div>
+                <div class="settings-desc">{{ t('export_steamdb_desc') || '把本地缓存（SteamWebAPI + 工坊依赖）合并成 RimCrow 格式的 steamDB.json。零网络请求，用于未来导入其他 mod 管理器或备份。' }}</div>
+                <div v-if="steamdbExport.path" class="settings-desc muted">
+                  ✅ 已导出：{{ steamdbExport.path }} · {{ steamdbExport.entries }} 条{{ steamdbExport.with_deps ? ` · ${steamdbExport.with_deps} 条含依赖` : '' }}
+                </div>
+                <button class="btn" :disabled="steamdbExport.exporting" @click="exportSteamdb">
+                  {{ steamdbExport.exporting ? '导出中…' : '导出 steamDB.json' }}
+                </button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">🌐 多人联机兼容性</div>
+                <div class="settings-desc">扫描已装 mod 的联机兼容性（从 Steam 描述/标签自动识别）。零网络请求，纯本地缓存分析。</div>
+                <div v-if="mpCompat.stats.total" class="mp-stats">
+                  <span class="mp-pill mp-full" v-if="mpCompat.stats.full">✅ 完全兼容 {{ mpCompat.stats.full }}</span>
+                  <span class="mp-pill mp-required" v-if="mpCompat.stats['mp-required']">🔴 联机框架 {{ mpCompat.stats['mp-required'] }}</span>
+                  <span class="mp-pill mp-partial" v-if="mpCompat.stats.partial">⚡ 部分兼容 {{ mpCompat.stats.partial }}</span>
+                  <span class="mp-pill mp-incompatible" v-if="mpCompat.stats.incompatible">⛔ 不兼容 {{ mpCompat.stats.incompatible }}</span>
+                  <span class="mp-pill mp-unknown" v-if="mpCompat.stats.unknown">❓ 未提及 {{ mpCompat.stats.unknown }}</span>
+                </div>
+                <div v-if="mpCompat.results && Object.keys(mpCompat.results).length" class="mp-list">
+                  <div v-for="(r, mid) in mpCompat.results" :key="mid" class="mp-item">
+                    <span class="mp-status-badge" :class="'mp-' + r.status">{{ mpStatusLabel(r.status) }}</span>
+                    <span class="mp-mod-name">{{ r.name }}</span>
+                    <span v-if="r.source === 'user-override'" class="mp-override-tag">手动</span>
+                    <select class="mp-override-select" :value="r.status" @change="setMpOverride(mid, $event.target.value)">
+                      <option value="auto" v-if="r.source === 'user-override'">自动检测</option>
+                      <option value="full">完全兼容</option>
+                      <option value="partial">部分兼容</option>
+                      <option value="incompatible">不兼容</option>
+                      <option value="mp-required">联机框架</option>
+                      <option value="unknown">未提及</option>
+                    </select>
+                    <span class="mp-reason" :title="r.reason">💡</span>
+                  </div>
+                </div>
+                <button class="btn" :disabled="mpCompat.checking" @click="checkMpCompatibility">
+                  {{ mpCompat.checking ? '扫描中…' : (mpCompat.lastChecked ? '重新扫描' : '扫描联机兼容性') }}
+                </button>
+              </div>
+            </template>
+
+            <template v-else-if="settingsTab === 'backup'">
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('backup_auto_title') }}</div>
+                <div class="settings-desc">{{ t('backup_auto_desc') }}</div>
+                <label class="p0-check">
+                  <input type="checkbox" v-model="backupSettings.auto_backup" />
+                  <span>{{ t('backup_auto_label') }}</span>
+                </label>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('backup_keep_title') }}</div>
+                <div class="settings-desc">{{ t('backup_keep_desc') }}</div>
+                <input class="backup-num-input" type="number" min="1" max="50" v-model.number="backupSettings.keep_versions" />
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('backup_dir_title') }}</div>
+                <div class="settings-desc">{{ t('backup_dir_desc') }}{{ backupSettings.effective_dir }}</div>
+                <div class="path-row">
+                  <input v-model="backupSettings.backup_dir" :placeholder="backupSettings.effective_dir" />
+                  <button class="btn" @click="pickBackupDir">{{ t('browse') }}</button>
+                </div>
+              </div>
+              <div class="btn-row">
+                <button class="btn" @click="openBackupFolder('')">{{ t('open_backup_dir') }}</button>
+                <div class="btn-spacer"></div>
+                <button class="btn btn-launch" @click="saveBackupSettings">{{ t('save') }}</button>
+              </div>
+            </template>
+
+            <template v-else-if="settingsTab === 'analyze'">
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('analyze_title') }}</div>
+                <div class="settings-desc">{{ t('analyze_desc') }}</div>
+                <button class="btn btn-launch" @click="analyzeDlls">{{ t('analyze_btn') }}</button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('dll_cache_title') }}</div>
+                <div class="settings-desc">{{ t('dll_cache_desc') }}</div>
+                <button class="btn" @click="clearDllCache">{{ t('dll_cache_btn') }}</button>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('tag_diag_title') }}</div>
+                <div class="settings-desc">{{ t('tag_diag_desc') }}</div>
+                <button class="btn" @click="openTagDiag">{{ t('view_tag_diag') }}</button>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="settings-section">
+                <div class="settings-about-title">Spire Mod Manager</div>
+                <div class="settings-desc">{{ t('version_label') }} {{ appInfo.version || '0.0.1' }}</div>
+                <div class="settings-desc">{{ t('about_desc') }}</div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 管理器标签编辑弹窗 -->
+    <div v-if="tagMenu.show" class="modal-mask" @click.self="saveModTags">
+      <div class="modal tag-modal">
+        <div class="modal-header">
+          <h3>{{ t('manage_tags_title') }}{{ tagMenu.mod ? tagMenu.mod.name : '' }}</h3>
+          <button class="btn-close-modal" @click="saveModTags" :title="t('close')">✕</button>
+        </div>
+        <div class="tag-pool">
+          <span v-for="t in tagMenu.allTags" :key="t"
+                class="tag-chip" :class="{ selected: tagMenu.tags.indexOf(t) >= 0 }"
+                @click="toggleTag(t)">
+            {{ tr(t) }}
+          </span>
+        </div>
+        <div class="path-row tag-add-row">
+          <input v-model="tagMenu.newTag" :placeholder="t('new_tag')" @keyup.enter="addTag" />
+          <button class="btn" @click="addTag">{{ t('add') }}</button>
+        </div>
+        <div class="tag-tip">{{ t('tag_tip') }}</div>
+        <div class="btn-row right">
+          <button class="btn btn-launch" @click="saveModTags">{{ t('save') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 游戏日志查看器 -->
+    <div v-if="logDiag.show" class="modal-mask" @click.self="closeLogDiag">
+      <div class="modal log-diag-modal">
+        <div class="modal-header">
+          <h3>{{ t('log_diag_title') }}</h3>
+          <button class="btn-close-modal" @click="closeLogDiag" :title="t('close')">✕</button>
+        </div>
+
+        <div class="log-toolbar">
+          <select v-model="logDiag.file" class="log-select" :title="t('log_file_label')" @change="loadGameLog">
+            <option v-for="f in logDiag.files" :key="f.name" :value="f.name">
+              {{ (f.is_current ? t('log_file_current') : f.name) + ' · ' + fmtBytes(f.size) }}
+            </option>
+          </select>
+          <select v-model="logDiag.level" class="log-select" :title="t('log_level_label')" @change="loadGameLog">
+            <option value="all">{{ t('log_level_all') }}</option>
+            <option value="info">{{ t('log_level_info') }}</option>
+            <option value="warn">{{ t('log_level_warn') }}</option>
+            <option value="error">{{ t('log_level_error') }}</option>
+          </select>
+          <input v-model="logDiag.keyword" class="log-search" :placeholder="t('log_filter_ph')" @keyup.enter="loadGameLog" />
+          <label class="log-regex"><input type="checkbox" v-model="logDiag.useRegex" @change="loadGameLog" />{{ t('log_regex') }}</label>
+          <button class="btn btn-small" @click="loadGameLog" :disabled="logDiag.loading">{{ t('log_refresh') }}</button>
+        </div>
+
+        <div v-if="logDiag.loading" class="log-diag-empty">{{ t('log_loading') }}</div>
+        <template v-else-if="!logDiag.available">
+          <div class="log-diag-empty">{{ t('log_not_found') }}</div>
+        </template>
+        <template v-else>
+          <div class="log-diag-summary">
+            {{ t('log_counts', { a: logDiag.total, s: logDiag.shown, i: logDiag.counts.info, w: logDiag.counts.warn, e: logDiag.counts.error }) }}
+            <span v-if="logDiag.truncated" class="log-trunc">{{ t('log_truncated') }}</span>
+          </div>
+          <div class="log-view">
+            <div v-for="(ln, i) in logDiag.lines" :key="i" class="log-line" :class="'lv-' + ln.level">{{ ln.text }}</div>
+            <div v-if="!logDiag.lines.length" class="log-diag-empty">{{ t('no_match') }}</div>
+          </div>
+          <div class="log-diag-path" :title="logDiag.path">{{ logDiag.path }}</div>
+        </template>
+
+        <div class="btn-row right">
+          <button class="btn" @click="closeLogDiag">{{ t('close') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 标签诊断弹窗 -->
+    <div v-if="tagDiag.show" class="modal-mask" @click.self="closeTagDiag">
+      <div class="modal tag-diag-modal">
+        <div class="modal-header">
+          <h3>{{ t('tag_diag_title') }}</h3>
+          <button class="btn-close-modal" @click="closeTagDiag" :title="t('close')">✕</button>
+        </div>
+        <div class="search-row">
+          <input v-model="tagDiag.filter" :placeholder="t('tag_diag_search')" class="search-input" />
+        </div>
+        <div v-if="tagDiag.selftest.length" class="tag-selftest">
+          <div class="tag-selftest-title">{{ t('selftest_title') }}</div>
+          <div v-for="st in tagDiag.selftest" :key="st.id" class="tag-selftest-item" :class="{ fail: !st.ok }">
+            <span class="tag-selftest-name">{{ st.name }}</span>
+            <span class="tag-selftest-res">{{ t('selftest_res', { e: tr(st.expected), a: st.actual ? tr(st.actual) : t('not_found') }) }}</span>
+            <span class="tag-selftest-mark">{{ st.ok ? '✓' : '✗' }}</span>
+          </div>
+        </div>
+        <div class="tag-diag-scroll">
+          <div v-if="tagDiag.loading" class="log-diag-empty">{{ t('analyzing') }}</div>
+          <div v-else-if="!filteredTagDiag.length" class="log-diag-empty">{{ t('no_match') }}</div>
+          <div v-for="it in filteredTagDiag" :key="it.id" class="tag-diag-item">
+            <div class="tag-diag-name">{{ it.name }}<span class="tag-diag-id">{{ it.id }}</span></div>
+            <div class="tag-diag-tags">
+              <span v-for="t in it.tags" :key="t" class="ws-tag manager-tag">{{ tr(t) }}</span>
+            </div>
+            <div class="tag-diag-reason">{{ it.reason }}</div>
+          </div>
+        </div>
+        <div class="btn-row right">
+          <button class="btn" @click="closeTagDiag">{{ t('close') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 存档管理 Modal -->
+    <div v-if="savesManager.show" class="modal-overlay" @click.self="savesManager.show = false">
+      <div class="modal saves-modal">
+        <div class="modal-header">
+          <span>💾 {{ t('saves_manager') }}</span>
+          <button class="btn-close" @click="savesManager.show = false">✕</button>
+        </div>
+        <div class="modal-body saves-body" v-if="!savesManager.busy">
+          <div v-if="savesManager.profiles.length === 0" class="saves-empty">
+            {{ t('saves_load_failed') }}
+          </div>
+          <div v-for="p in savesManager.profiles" :key="p.profile" class="saves-profile">
+            <div class="saves-profile-title">{{ t('saves_slot') || '存档槽位' }} {{ p.profile }}</div>
+            <div class="saves-slots">
+              <!-- 官方存档 -->
+              <div class="saves-slot official" :class="{ empty: !p.official }">
+                <div class="saves-slot-header">
+                  <span class="slot-label">{{ t('official_save') }}</span>
+                  <button v-if="p.official" class="btn btn-small" @click="backupSaveSlot(p.profile, 'official')">{{ t('backup') }}</button>
+                </div>
+                <div v-if="p.official" class="saves-slot-info">
+                  <div>📁 {{ p.official.file_count }} {{ t('files') || '文件' }} · {{ formatSize(p.official.total_size) }}</div>
+                  <div class="saves-slot-path" :title="p.official.path">{{ p.official.path }}</div>
+                  <div v-if="p.official.latest_mtime" class="saves-slot-mtime">最近: {{ formatTime(p.official.latest_mtime) }}</div>
+                </div>
+                <div v-else class="saves-slot-empty">{{ t('saves_empty') }}</div>
+              </div>
+              <!-- Modded 存档 -->
+              <div class="saves-slot modded" :class="{ empty: !p.modded }">
+                <div class="saves-slot-header">
+                  <span class="slot-label">{{ t('modded_save') }}</span>
+                  <button v-if="p.modded" class="btn btn-small" @click="backupSaveSlot(p.profile, 'modded')">{{ t('backup') }}</button>
+                </div>
+                <div v-if="p.modded" class="saves-slot-info">
+                  <div>📁 {{ p.modded.file_count }} {{ t('files') || '文件' }} · {{ formatSize(p.modded.total_size) }}</div>
+                  <div class="saves-slot-path" :title="p.modded.path">{{ p.modded.path }}</div>
+                  <div v-if="p.modded.latest_mtime" class="saves-slot-mtime">最近: {{ formatTime(p.modded.latest_mtime) }}</div>
+                </div>
+                <div v-else class="saves-slot-empty">{{ t('saves_empty') }}</div>
+              </div>
+            </div>
+
+            <!-- 已有备份 -->
+            <div v-if="(savesManager.backups.find(b => b.profile === p.profile)?.official?.length || 0) + (savesManager.backups.find(b => b.profile === p.profile)?.modded?.length || 0) > 0"
+                 class="saves-backups">
+              <div class="saves-backups-title">📦 已有备份</div>
+              <div v-for="bk in savesManager.backups.filter(b => b.profile === p.profile)" :key="'bk-' + bk.profile">
+                <div v-if="bk.official && bk.official.length" class="saves-backup-group">
+                  <span class="bk-kind">{{ t('official_save') }}</span>
+                  <div v-for="f in bk.official" :key="f.path" class="saves-backup-item">
+                    <span class="bk-name">{{ f.name.replace('official_', '').replace('.zip', '') }}</span>
+                    <span class="bk-meta">{{ formatSize(f.size) }} · {{ formatTime(f.mtime) }}</span>
+                    <button class="btn btn-small" @click="restoreSaveSlot(p.profile, 'official', f.path)">{{ t('restore') || '还原' }}</button>
+                  </div>
+                </div>
+                <div v-if="bk.modded && bk.modded.length" class="saves-backup-group">
+                  <span class="bk-kind">{{ t('modded_save') }}</span>
+                  <div v-for="f in bk.modded" :key="f.path" class="saves-backup-item">
+                    <span class="bk-name">{{ f.name.replace('modded_', '').replace('.zip', '') }}</span>
+                    <span class="bk-meta">{{ formatSize(f.size) }} · {{ formatTime(f.mtime) }}</span>
+                    <button class="btn btn-small" @click="restoreSaveSlot(p.profile, 'modded', f.path)">{{ t('restore') || '还原' }}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-if="savesManager.profiles.length === 0" class="saves-empty">
+            {{ t('saves_empty') }}
+          </div>
+        </div>
+        <div v-else class="modal-body saves-busy">{{ t('loading') || '加载中…' }}</div>
+        <div class="modal-footer">
+          <button class="btn" @click="loadSavesList" :disabled="savesManager.busy">🔄 {{ t('refresh') || '刷新' }}</button>
+          <div class="btn-row right">
+            <button class="btn" @click="savesManager.show = false">{{ t('close') }}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="vue.global.prod.js?v=1"></script>
+  <script src="i18n.js?v=20261102a"></script>
+  <script src="api.js?v=20261102a"></script>
+  <script src="app.js?v=20261103e"></script>
+</body>
+</html>

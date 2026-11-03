@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../SteamLibrary/steamapps/workshop/content/2868840"
+		},
+		{
+			"path": "../../../../SteamLibrary/steamapps/common/Slay the Spire 2"
+		}
+	],
+	"trae": {
+		"workspaceId": "502336f466d6df112b668106ca38ad9b"
+	},
+	"settings": {}
+}

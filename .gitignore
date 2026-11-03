@@ -1,0 +1,32 @@
+# ── 开发工具 / 临时脚本 / 归档 ──
+tools/
+archive/
+_test_*.py
+RIMCROW_*.md
+*工坊*.txt
+新建*.txt
+启动mod*.bat
+
+# ── RimCrow 逆向产物（100MB+ 二进制，非 SMM 源码）──
+rimcrow_ref/
+
+# ── 产物 / 缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ── 数据 ──
+data/
+data/**
+!data/.gitkeep
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+
+# ── 日志 ──
+*.log
+logs/
