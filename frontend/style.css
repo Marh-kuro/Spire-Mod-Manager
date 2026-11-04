@@ -715,10 +715,59 @@ body {
 }
 
 .ws-desc {
-  margin-top: 8px;
+  margin-top: 0;
   color: #4a4a4a;
   line-height: 1.5;
   font-size: 12px;
+}
+
+/* 模组简介标题 + 分界线；提示与按钮在分界线上方靠右 */
+.ws-desc-head {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ws-desc-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2a2a2a;
+}
+
+.ws-desc-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: #8a6d3b;
+}
+
+.ws-desc-divider {
+  margin: 6px 0 8px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.ws-translate-btn {
+  padding: 3px 10px;
+  border: 1px solid rgba(176, 137, 70, 0.55);
+  border-radius: 4px;
+  background: rgba(176, 137, 70, 0.12);
+  color: #8a6d3b;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ws-translate-btn:hover:not(:disabled) {
+  background: rgba(176, 137, 70, 0.22);
+}
+
+.ws-translate-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* ── Steam BBCode 渲染样式 ── */
@@ -912,6 +961,30 @@ body {
   background: var(--topbar);
   color: var(--deep-purple);
 }
+
+/* 2026-11-05 Ctrl/Shift 多选样式：比主选中（深蓝色底）更轻的浅蓝底 */
+.mod-item.multi-selected {
+  background: rgba(52, 152, 219, 0.18);
+  box-shadow: inset 0 0 0 2px rgba(52, 152, 219, 0.5);
+}
+
+.multi-indicator {
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.75;
+  padding: 0 4px;
+}
+
+.btn-batch {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  background: var(--topbar);
+  color: var(--deep-purple);
+  border: none;
+  cursor: pointer;
+}
+.btn-batch:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* 刚启用的脉冲高亮特效 */
 @keyframes pulseHighlight {
@@ -1332,16 +1405,6 @@ body {
   font-size: 13px;
 }
 
-.corner-progress-fill.indeterminate {
-  width: 40%;
-  animation: corner-indeterminate 1.2s ease-in-out infinite;
-}
-
-@keyframes corner-indeterminate {
-  0% { margin-left: 0; }
-  50% { margin-left: 60%; }
-  100% { margin-left: 0; }
-}
 
 .restore-modal {
   max-width: 460px;
@@ -2033,7 +2096,7 @@ body {
   font-size: 12px;
 }
 
-/* 右上角悬浮提示 */
+/* 右上角悬浮提示（仅提示类信息，带手动关闭与悬停暂停） */
 .toast-container {
   position: fixed;
   top: 56px;
@@ -2046,77 +2109,151 @@ body {
 }
 
 .toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   background: var(--deep-purple);
   color: #fff;
-  padding: 10px 14px;
+  padding: 10px 12px 10px 14px;
   border-radius: 8px;
+  border-left: 3px solid rgba(255, 255, 255, 0.35);
   font-size: 13px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  max-width: 360px;
-  word-break: break-all;
+  width: max-content;
+  max-width: min(480px, calc(100vw - 24px));
+  min-width: 280px;
+  overflow-wrap: anywhere;
   animation: toast-in 0.2s ease-out;
+  pointer-events: auto;
 }
+
+.toast-info { background: var(--deep-purple); }
+.toast-success { background: #166534; border-left-color: #4ade80; }
+.toast-warning { background: #92400e; border-left-color: #fbbf24; }
+.toast-error { background: #991b1b; border-left-color: #f87171; }
+
+.toast-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  flex-shrink: 0;
+  background: transparent;
+  border: 0;
+  padding: 0 0 0 4px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 13px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.toast-close:hover { color: #fff; }
 
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(-8px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* DLL 分析进度条（中下方） */
-.dll-progress-bar {
+/* 正下方统一任务进度容器 */
+.progress-stack {
   position: fixed;
   left: 50%;
   bottom: 24px;
   transform: translateX(-50%);
   width: 420px;
   max-width: 90vw;
+  max-height: 45vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 500;
+}
+
+/* 右上角并发任务数角标 */
+.progress-badge {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 450;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 13px;
+  background: var(--deep-purple);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  pointer-events: auto;
+  cursor: default;
+}
+
+.progress-card {
   background: var(--deep-purple);
   color: #fff;
   padding: 12px 16px;
   border-radius: 10px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-  z-index: 500;
 }
 
-.dll-progress-text {
+.progress-text {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 13px;
   margin-bottom: 8px;
+}
+
+.progress-title {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.dll-progress-track {
+.progress-count {
+  flex-shrink: 0;
+  opacity: 0.9;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-track {
   height: 8px;
   background: rgba(255, 255, 255, 0.25);
   border-radius: 4px;
   overflow: hidden;
 }
 
-.dll-progress-fill {
+.progress-fill {
   height: 100%;
   background: #fff;
   border-radius: 4px;
   transition: width 0.15s ease-out;
 }
 
-.scan-progress-fill {
-  background: #4ade80;  /* 扫描进度条用绿色区分 */
+.progress-fill.fill-blue { background: #60a5fa; }
+.progress-fill.fill-green { background: #4ade80; }
+.progress-fill.fill-purple { background: #a78bfa; }
+
+/* 不确定进度：左右滑块来回滑动 */
+.progress-fill.indeterminate {
+  width: 40%;
+  animation: progress-slide 1.2s ease-in-out infinite;
 }
 
-/* 后台两阶段补全进度——颜色区分：阶段1绿色(快速)，阶段2蓝色(慢速) */
-.bg-progress-bar .bg-phase1 {
-  background: #4ade80;
-}
-.bg-progress-bar .bg-phase2 {
-  background: #60a5fa;
-  mix-blend-mode: normal;
-}
-/* 计算中：不确定进度条（复用 corner-indeterminate 的滑动动画） */
-.bg-progress-bar .dll-progress-fill.indeterminate {
-  width: 40%;
-  animation: corner-indeterminate 1.2s ease-in-out infinite;
-  background: #a78bfa;  /* 紫色 = 计算中，和运行中的绿/蓝区分 */
+@keyframes progress-slide {
+  0% { margin-left: 0; }
+  50% { margin-left: 60%; }
+  100% { margin-left: 0; }
 }
 
 /* ============ 按需 HTML 补全状态条（预览面板内） ============ */
@@ -2148,56 +2285,6 @@ body {
   background: rgba(74, 222, 128, 0.12);
   border-color: rgba(74, 222, 128, 0.25);
   color: #86efac;
-}
-
-.dll-progress-count {
-  margin-top: 6px;
-  font-size: 11px;
-  text-align: right;
-  opacity: 0.85;
-}
-
-/* 右上角预览下载进度条 */
-.corner-progress-container {
-  position: fixed;
-  top: 56px;
-  right: 12px;
-  z-index: 500;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  pointer-events: none;
-}
-
-.corner-progress {
-  width: 260px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--deep-purple);
-  color: #fff;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-}
-
-.corner-progress-text {
-  font-size: 12px;
-  margin-bottom: 6px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.corner-progress-track {
-  height: 6px;
-  background: rgba(255, 255, 255, 0.25);
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.corner-progress-fill {
-  height: 100%;
-  background: #fff;
-  border-radius: 3px;
-  transition: width 0.15s ease-out;
 }
 
 /* ===== 新增 2026-10-13 ===== */

@@ -438,6 +438,8 @@ class ManagerState:
     language: str = "zh"
     # P0: 自动检查 Steam 工坊详情（在线标题/更新时间/有效性）。默认 True。
     auto_check_steam: bool = True
+    # 工坊页面自动补全（依赖 + 中文描述）。默认 True；False 时只用本地缓存/API 快照
+    workshop_html_fill: bool = True
     # ── P0 新增：自定义分组 ──
     # key=分组名，value=[mod_id (lower), ...]；用户自建的分组
     groups: dict[str, list[str]] = field(default_factory=dict)

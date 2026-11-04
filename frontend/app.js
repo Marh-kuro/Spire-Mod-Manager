@@ -58,6 +58,15 @@ const app = createApp({
     // === 响应式数据 ===
     const state = reactive({ enabled: [], disabled: [], packs: [], backups: [], backup_stats: {}, game_root: null, errors: [], steam_id: null, subscribed_known: true, breakdown: null });
     const selected = ref(null);
+    // 2026-11-05 Ctrl/Shift 多选集合：ref([]) 而非 Set，Vue 能追踪 .includes() 变化
+    const multiSelected = ref([]);
+    const multiSelectedCount = computed(() => multiSelected.value.length);
+    const _multiHas = (vk) => multiSelected.value.includes(vk);
+    const _multiAdd = (vk) => { if (!_multiHas(vk)) multiSelected.value.push(vk); };
+    const _multiDel = (vk) => { multiSelected.value = multiSelected.value.filter(x => x !== vk); };
+    const _multiClear = () => { multiSelected.value = []; };
+    // shift 多选的锚点（第一次点击的副本 version_key）
+    const _rangeAnchorKey = ref(null);
     const enabledSearch = ref('');
     const disabledSearch = ref('');
     // 界面语言（zh / en）与标签中英文对照表
@@ -126,7 +135,8 @@ const app = createApp({
     const backupMenu = reactive({ show: false, x: 0, y: 0, backup: null });
     const backupMenuEl = ref(null);
     const restoreDlg = reactive({ show: false, backup: null, busy: false });
-    const backupBusy = reactive({ show: false, text: '' });
+    // 备份/还原/校验任务状态
+    const backupBusy = reactive({ show: false, text: '', mode: 'indeterminate', done: 0, total: 0 });
     const backupSettings = reactive({ auto_backup: true, keep_versions: 3, backup_dir: '', effective_dir: '' });
     const packMenu = reactive({ show: false, x: 0, y: 0, pack: null });
     const menuEl = ref(null);
@@ -136,7 +146,7 @@ const app = createApp({
     const packTab = ref('packs');
     const skin = reactive({ available: false, roles: [], config_found: false, manager: 'native' });
     const card = reactive({ available: false, roles: [], config_found: false, manager: 'native' });
-    const settings = reactive({ show: false, form: { manual_game_root: '', manual_mods_dirs: '', manual_workshop_dir: '', manual_mods_dir: '', manual_save_dir: '', language: 'zh' } });
+    const settings = reactive({ show: false, form: { manual_game_root: '', manual_mods_dirs: '', manual_workshop_dir: '', manual_mods_dir: '', manual_save_dir: '', language: 'zh', workshop_html_fill: true } });
     const settingsTab = ref('paths');
     // 工坊更新检查
     const workshopUpdates = reactive({ checking: false, checked: 0, errors: 0, updates: [], lastChecked: '' });
@@ -183,16 +193,109 @@ const app = createApp({
     });
     // 标签诊断面板
     const tagDiag = reactive({ show: false, loading: false, items: [], filter: '', selftest: [], selftestLoading: false });
-    // 右上角悬浮提示
+    // 右上角悬浮提示（仅提示类信息，带手动关闭与悬停暂停）
     const toasts = reactive([]);
     let toastSeq = 0;
-    function showToast(text) {
+    const TOAST_DURATION = { success: 3000, info: 3000, warning: 4000, error: 5000 };
+    const TOAST_MAX = 5;
+    const TOAST_DEDUPE_MS = 2000;
+    const toastTimers = new Map();   // id -> { timer, started, remaining }
+    const toastRecent = new Map();   // "type|text" -> 最近出现时间
+    const toastClosed = new Set();   // 用户手动关闭过的 key
+
+    function _clearToastTimer(id) {
+      const st = toastTimers.get(id);
+      if (st && st.timer) clearTimeout(st.timer);
+      toastTimers.delete(id);
+    }
+
+    function _evictToastForRoom() {
+      // 错误优先保留：先淘汰最早的非错误提示
+      const idx = toasts.findIndex(x => x.type !== 'error');
+      dismissToast(idx >= 0 ? toasts[idx].id : toasts[0].id);
+    }
+
+    function showToast(text, type = 'info', opts = {}) {
+      const content = String(text == null ? '' : text);
+      const kind = TOAST_DURATION[type] ? type : 'info';
+      const key = opts.key || null;
+      const now = Date.now();
+      for (const [k, ts] of toastRecent) {
+        if (now - ts > 5000) toastRecent.delete(k);
+      }
+
+      // 同 key 原地更新，不新增第二条
+      if (key) {
+        const found = toasts.find(x => x.key === key);
+        if (found) {
+          found.text = content;
+          if (kind === 'error') found.type = 'error';
+          else if (found.type !== 'error' && kind !== 'info') found.type = kind;
+          if (opts.sticky) _clearToastTimer(found.id);
+          else armToastTimer(found.id, TOAST_DURATION[found.type]);
+          return found.id;
+        }
+        // 手动关闭过的 key 不复活；错误升级除外
+        if (toastClosed.has(key) && kind !== 'error') return null;
+      }
+
+      // 同类事件合并计数（不同 wid 的同类事件，2 秒窗口内累加）
+      if (opts.mergeKey) {
+        const merged = toasts.find(x => x.mergeKey === opts.mergeKey && !x.key);
+        if (merged) {
+          merged.count = (merged.count || 1) + 1;
+          merged.text = opts.mergeText ? opts.mergeText(merged.count) : content;
+          armToastTimer(merged.id, TOAST_DURATION[merged.type]);
+          return merged.id;
+        }
+      }
+
+      // 无 key 的重复文案去重
+      const dedupeKey = kind + '|' + content;
+      const last = toastRecent.get(dedupeKey);
+      if (last && now - last < TOAST_DEDUPE_MS) return null;
+      toastRecent.set(dedupeKey, now);
+
+      while (toasts.length >= TOAST_MAX) _evictToastForRoom();
       const id = ++toastSeq;
-      toasts.push({ id, text });
-      setTimeout(() => {
-        const i = toasts.findIndex(t => t.id === id);
-        if (i >= 0) toasts.splice(i, 1);
-      }, 3000);
+      toasts.push({ id, key, text: content, type: kind, mergeKey: opts.mergeKey || null, count: 1 });
+      if (opts.sticky) _clearToastTimer(id);
+      else armToastTimer(id, TOAST_DURATION[kind]);
+      return id;
+    }
+
+    function armToastTimer(id, duration) {
+      _clearToastTimer(id);
+      const st = { started: Date.now(), remaining: duration, timer: setTimeout(() => dismissToast(id), duration) };
+      toastTimers.set(id, st);
+    }
+
+    function pauseToast(item) {
+      const st = item && toastTimers.get(item.id);
+      if (!st || !st.timer) return;
+      clearTimeout(st.timer);
+      st.timer = null;
+      st.remaining = Math.max(0, st.remaining - (Date.now() - st.started));
+    }
+
+    function resumeToast(item) {
+      const st = item && toastTimers.get(item.id);
+      if (!st) return;
+      if (st.remaining <= 0) { dismissToast(item.id); return; }
+      armToastTimer(item.id, st.remaining);
+    }
+
+    function dismissToast(id, manual = false) {
+      const idx = toasts.findIndex(x => x.id === id);
+      const item = idx >= 0 ? toasts[idx] : null;
+      if (manual && item && item.key) toastClosed.add(item.key);
+      _clearToastTimer(id);
+      if (idx >= 0) toasts.splice(idx, 1);
+    }
+
+    function dismissToastKey(key) {
+      const item = toasts.find(x => x.key === key);
+      if (item) dismissToast(item.id);
     }
 
     // 后端异步派发支持：pywebview API 返回 {"ok":true, "async_id":"xxx"} 时，
@@ -213,7 +316,13 @@ const app = createApp({
         api().list_backups().then(r => {
           if (r && r.backups) { state.backups = r.backups; state.backup_stats = r.stats || state.backup_stats; }
         }).catch(() => {});
-        (names || []).forEach(n => showToast(t('auto_backup_done', { name: n })));
+        const names = Array.isArray(names) ? names : [];
+        if (names.length === 1) {
+          showToast(t('auto_backup_done', { name: names[0] }), 'success');
+        } else if (names.length > 1) {
+          const shown = names.slice(0, 3).join(', ') + (names.length > 3 ? '…' : '');
+          showToast(t('auto_backup_done_many', { n: names.length, names: shown }), 'success');
+        }
       } catch (_) {}
     };
 
@@ -523,6 +632,56 @@ const app = createApp({
       return desc;
     });
 
+    // 提示/按钮只在双语档（15%~30%）出现；<15% 由后台自动抓，≥30% 已有中文
+    // 阈值与后端 workshop.py 的 _ZH_RATIO_WEAK / _ZH_RATIO_ENOUGH 保持一致
+    const ZH_RATIO_WEAK = 0.15;
+    const ZH_RATIO_ENOUGH = 0.30;
+    const translationBusy = ref(false);
+    const translationPolling = ref(false);
+    let translationPollToken = 0;
+    const _descRatio = () => {
+      const d = workshop.data;
+      return d && typeof d.zh_ratio === 'number' ? d.zh_ratio : null;
+    };
+    const _isBilingual = (d, ratio) => ratio === null
+      ? !!d.is_bilingual
+      : (ratio >= ZH_RATIO_WEAK && ratio < ZH_RATIO_ENOUGH);
+    const canFetchTranslation = computed(() => {
+      const d = workshop.data;
+      if (!d || !selected.value || !selected.value.workshop_id) return false;
+      if (translationPolling.value) return false;  // 抓取中只留 Toast
+      if (!_isBilingual(d, _descRatio())) return false;
+      // 当前版本已检查过（无论是否找到中文）→ 收起，避免反复提示
+      const checkedCurrent = !!(d.html_checked
+        && Number(d.html_time_updated || 0) === Number(d.time_updated || 0));
+      return !checkedCurrent;
+    });
+    const translationHint = computed(() => {
+      const d = workshop.data;
+      if (!d) return '';
+      if (_isBilingual(d, _descRatio())) return t('desc_bilingual');
+      return t('desc_original_lang', { lang: t('lang_' + (d.desc_lang || 'unknown')) });
+    });
+
+    async function fetchCommunityTranslation() {
+      const m = selected.value;
+      if (!m) return;
+      translationBusy.value = true;
+      try {
+        const r = await api().request_workshop_translation(m.id);
+        if (!r || !r.ok) {
+          showToast(t('translation_failed'), 'warning');
+          return;
+        }
+        showToast(t('translation_queued'), 'info', { key: 'html:' + (m.workshop_id || ''), sticky: true });
+        _pollHtmlFill(m, workshopSeq);
+      } catch (e) {
+        showToast(t('translation_failed'), 'warning');
+      } finally {
+        translationBusy.value = false;
+      }
+    }
+
     // _relTime 已提升到全局作用域（行 41），避免缓存版本 return 里缺失导致模板崩
 
     function subText(m) {
@@ -576,8 +735,9 @@ const app = createApp({
     async function refresh(showProgress = false) {
       const keepId = selected.value ? selected.value.id : null;
       const startResp = await api().refresh();
-      if (!startResp.running && startResp.ok === false) {
-        showToast(startResp.error === 'scan_already_running' ? t('scan_already_running') : t('scan_failed'));
+      const alreadyRunning = !startResp.running && startResp.error === 'scan_already_running';
+      if (!startResp.running && startResp.ok === false && !alreadyRunning) {
+        showToast(t('scan_failed'), 'error');
         return null;
       }
 
@@ -621,7 +781,7 @@ const app = createApp({
       if (showProgress) scanProgress.show = false;
 
       if (result.error) {
-        if (showProgress) showToast(t('scan_failed') + ': ' + result.error);
+        if (showProgress) showToast(t('scan_failed') + ': ' + result.error, 'error');
         return null;
       }
       const s = result.result;
@@ -644,7 +804,17 @@ const app = createApp({
       loadSkinState();
       loadCardState();
       const r = s.scan_report || {};
-      showToast(t('scan_done', { total: r.total || 0, new: r.new || 0, updated: r.updated || 0, deleted: r.deleted || 0, known: r.known || 0 }));
+      // B2：只列非零项 + 独立"未发现变化"分支（定论方案）
+      const n = r.new || 0, u = r.updated || 0, d = r.deleted || 0;
+      if (!n && !u && !d) {
+        showToast(t('scan.done.no_change'), 'success');
+      } else {
+        const parts = [];
+        if (n) parts.push(t('scan.done.new', { n }));
+        if (u) parts.push(t('scan.done.updated', { n: u }));
+        if (d) parts.push(t('scan.done.removed', { n: d }));
+        showToast(t('scan.done.mixed') + '：' + parts.join('，'), 'success');
+      }
     }
 
     async function analyzeDlls() {
@@ -652,7 +822,7 @@ const app = createApp({
       const total = r.total || 0;
       const skipped = r.skipped || 0;
       if (skipped) {
-        showToast(t('skipped_manual', { n: skipped }));
+        showToast(t('skipped_manual', { n: skipped }), 'warning');
       }
       if (!total) return;
       dllProgress.show = true;
@@ -763,6 +933,7 @@ const app = createApp({
       nextTick(drawDeps);
       _maybePollTitles(s.titles_pending);
       _maybePollBgProgress();
+      _maybePollHtmlTasks();
     }
 
     // ---------------------------------------------------------------- 标题补全轮询
@@ -822,15 +993,80 @@ const app = createApp({
     _maybePollBgProgress();
     // 每次 applyState 也触发（如果之前 timer 被清了，refresh 完后台又起来了）
 
-    function select(m, side) {
+    // ---------------------------------------------------------------- 统一 HTML 队列轮询
+    // 启用/预览只把任务入队，后端单消费者串行抓取。
+    // 这里轻量轮询任务状态，有任务完成时静默拉一次 state，让标题/标签/依赖刷新。
+    let _htmlTasksPollTimer = null;
+    let _htmlTasksDoneCount = 0;
+    function _maybePollHtmlTasks() {
+      if (_htmlTasksPollTimer) return;
+      let ticks = 0;
+      _htmlTasksPollTimer = setInterval(async () => {
+        ticks++;
+        try {
+          const r = await api().get_html_tasks();
+          const items = (r && r.items) || {};
+          const list = Object.values(items);
+          const doneCount = list.filter(x => x && (x.status === 'done' || x.status === 'failed')).length;
+          const busy = ((r && r.pending && r.pending.length) || 0) > 0
+            || list.some(x => x && x.status === 'running');
+          if (doneCount !== _htmlTasksDoneCount) {
+            _htmlTasksDoneCount = doneCount;
+            applyState(await api().get_state());
+          }
+          if (!busy || ticks > 2000) {
+            clearInterval(_htmlTasksPollTimer);
+            _htmlTasksPollTimer = null;
+          }
+        } catch (e) { /* ignore */ }
+      }, 3000);
+    }
+
+    function select(m, side, event) {
+      const vk = m.__version_key;
+      // Ctrl/Meta（Mac）点击：toggle 单个
+      if (event && (event.ctrlKey || event.metaKey)) {
+        if (_multiHas(vk)) {
+          _multiDel(vk);
+        } else {
+          _multiAdd(vk);
+        }
+        selected.value = m;
+        _rangeAnchorKey.value = vk;
+        nextTick(drawDeps);
+        loadWorkshop(m);
+        return;
+      }
+      // Shift 点击：范围选择（从锚点到当前副本，限制在同 is_enabled 侧，不能跨启用/停用）
+      if (event && event.shiftKey && _rangeAnchorKey.value) {
+        const allFlat = expandModList([...state.enabled, ...state.disabled]);
+        const anchorIdx = allFlat.findIndex(x => x.__version_key === _rangeAnchorKey.value);
+        const curIdx = allFlat.findIndex(x => x.__version_key === vk);
+        if (anchorIdx >= 0 && curIdx >= 0) {
+          const anchorEnabled = allFlat[anchorIdx].is_enabled;
+          const [lo, hi] = anchorIdx < curIdx ? [anchorIdx, curIdx] : [curIdx, anchorIdx];
+          for (let i = lo; i <= hi; i++) {
+            if (allFlat[i].is_enabled === anchorEnabled) {
+              _multiAdd(allFlat[i].__version_key);
+            }
+          }
+        }
+        selected.value = m;
+        nextTick(drawDeps);
+        loadWorkshop(m);
+        return;
+      }
+      // 普通点击：清空多选 + 设置主选中
+      _multiClear();
       selected.value = m;
+      _rangeAnchorKey.value = vk;
       nextTick(drawDeps);
       loadWorkshop(m);
     }
 
     // 复制指定文本（模组名称 / 标签等单击复制）
     async function copyText(text) {
-      if (!text) { showToast(t('no_desc_copy')); return; }
+      if (!text) { showToast(t('no_desc_copy'), 'warning'); return; }
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
           await navigator.clipboard.writeText(text);
@@ -842,9 +1078,9 @@ const app = createApp({
           document.execCommand('copy');
           document.body.removeChild(ta);
         }
-        showToast(t('copied'));
+        showToast(t('copied'), 'success');
       } catch (e) {
-        showToast(t('copy_failed') + (e && e.message ? e.message : e));
+        showToast(t('copy_failed') + (e && e.message ? e.message : e), 'error');
       }
     }
 
@@ -858,8 +1094,75 @@ const app = createApp({
       running: false,
       show: false,
     });
-    // 预览加载进度条（显示具体 mod + 百分比）
-    const previewProgress = reactive({ show: false, name: '', percent: 0 });
+    // 正下方任务进度卡片：汇总所有带进度的任务
+    const progressCards = computed(() => {
+      const cards = [];
+      if (backupBusy.show) {
+        cards.push({
+          id: 'backup', title: backupBusy.text,
+          indeterminate: backupBusy.mode === 'indeterminate',
+          done: backupBusy.done, total: backupBusy.total,
+        });
+      }
+      if (bulkProgress.show) {
+        cards.push({
+          id: 'bulk', title: t('bulk_downloading_soft'),
+          indeterminate: false, done: bulkProgress.done, total: bulkProgress.total,
+          fillClass: 'fill-blue',
+        });
+      }
+      if (dllProgress.show) {
+        cards.push({
+          id: 'dll',
+          title: dllProgress.current ? dllProgress.current + ' ' + t('analyzing') : t('analyzing_dll'),
+          indeterminate: false, done: dllProgress.done, total: dllProgress.total,
+        });
+      }
+      if (scanProgress.show) {
+        const stageLabel = t({ fetch_deps: 'scan_stage_deps', finalize: 'scan_stage_finalize' }[scanProgress.stage] || 'scanning');
+        cards.push({
+          id: 'scan',
+          title: (stageLabel + ' ' + (scanProgress.current || '')).trim(),
+          indeterminate: false, done: scanProgress.done, total: scanProgress.total,
+          fillClass: 'fill-green',
+        });
+      }
+      if (bgProgress.show) {
+        const p1 = bgProgress.phase1;
+        const title = p1.total < 0 ? t('bg_fill_preparing') : (p1.running ? t('bg_fill_phase1') : t('bg_fill_done'));
+        cards.push({
+          id: 'bg',
+          title,
+          indeterminate: p1.total < 0,
+          done: Math.max(0, p1.done || 0),
+          total: Math.max(0, p1.total || 0),
+          fillClass: p1.total < 0 ? 'fill-purple' : 'fill-green',
+        });
+      }
+      return cards.map(c => {
+        const total = Math.max(0, c.total || 0);
+        const done = Math.max(0, c.done || 0);
+        const indeterminate = c.indeterminate || total <= 0;
+        return {
+          ...c,
+          indeterminate,
+          percent: indeterminate ? 0 : Math.min(100, done / total * 100),
+          countText: indeterminate ? '' : `${Math.min(done, total)}/${total}`,
+        };
+      });
+    });
+
+    // 正下方只展示优先级最高的一条，其余用右上角角标计数
+    const PROGRESS_PRIORITY = { backup: 1, scan: 2, bulk: 3, dll: 4, bg: 5 };
+    const currentProgressCard = computed(() => {
+      const cards = progressCards.value;
+      if (!cards.length) return null;
+      return cards.slice().sort(
+        (a, b) => (PROGRESS_PRIORITY[a.id] || 99) - (PROGRESS_PRIORITY[b.id] || 99)
+      )[0];
+    });
+    const progressTaskCount = computed(() => progressCards.value.length);
+
     // 「打开详情」菜单（类似右键菜单）
     const wsMenu = reactive({ show: false, x: 0, y: 0 });
 
@@ -882,7 +1185,8 @@ const app = createApp({
       workshop.error = '';
       workshop.html_just_filled = false;
       wsMenu.show = false;
-      previewProgress.show = false;
+      translationPollToken++;
+      translationPolling.value = false;
       if (!m || !m.workshop_id) return;
 
       // 只有完全无缓存才显示进度条；已有缓存（无论完整/不完整）都秒开
@@ -916,38 +1220,78 @@ const app = createApp({
       }
     }
 
-    // 用户点选 → 后台 daemon 线程异步爬 HTML 补中文 desc → 5s 轮询等补完自动刷新
+    // 用户点选 → 后端统一 HTML 队列补中文 desc → 轮询任务状态，完成后再拉一次详情
     function _pollHtmlFill(m, seq) {
       let ticks = 0;
-      let staleCount = 0;  // 连续多少次 desc 还没补完
-      const timer = setInterval(async () => {
-        ticks++;
-        if (seq !== workshopSeq) { clearInterval(timer); return; }
-        if (ticks > 60) { clearInterval(timer); return; }  // 5 分钟兜底
+      let busy = false;
+      const modName = (m && (m.name || m.title)) || '';
+      const toastKeyOf = () => {
+        const wid = workshop.data && workshop.data.workshop_id;
+        return wid ? 'html:' + wid : '';
+      };
+      const token = ++translationPollToken;
+      translationPolling.value = true;
+      const stop = (_tk) => {
+        if (token === translationPollToken) translationPolling.value = false;
+        if (_tk) dismissToastKey(_tk);
+        clearInterval(timer);
+      };
+      const tick = async () => {
+        if (busy) return;
+        busy = true;
+        const tk = toastKeyOf();
         try {
+          ticks++;
+          if (seq !== workshopSeq) { stop(tk); return; }
+          if (ticks > 60) { stop(tk); return; }  // 5 分钟兜底
+          // 先看统一队列里该 wid 的状态，避免每 5s 重复拉完整详情
+          const tasks = await api().get_html_tasks();
+          if (seq !== workshopSeq) { stop(tk); return; }
+          const wid = workshop.data && workshop.data.workshop_id;
+          const st = wid && tasks && tasks.items ? tasks.items[wid] : null;
+          if (st && (st.status === 'queued' || st.status === 'running')) {
+            if (tk) showToast(t('preview_fetching', { name: modName }), 'info', { key: tk, sticky: true });
+            return;
+          }
+          if (st && st.status === 'failed') {
+            if (tk) showToast(t('preview_fetch_failed', { name: modName }), 'warning', { key: tk });
+            stop(tk);
+            return;
+          }
+
           const d = await api().get_workshop_details(m.id);
-          if (seq !== workshopSeq) { clearInterval(timer); return; }
-          if (d && d.desc_src === 'html') {
+          if (seq !== workshopSeq) { stop(tk); return; }
+          if (d && d.html_desc_state === 'updated') {
             // 后台 HTML 补完 desc！刷新前端显示
             workshop.data = d;
             workshop.error = '';
             workshop.html_just_filled = true;
-            clearInterval(timer);
+            if (tk) showToast(t('preview_fetched', { name: modName }), 'success', { key: tk });
+            stop(tk);
             setTimeout(() => {
               if (seq === workshopSeq) workshop.html_just_filled = false;
             }, 3000);
           } else if (d && d.html_checked) {
-            // 后台线程跑完了但没拿到中文 desc（社区也没翻）→ 停止轮询
-            clearInterval(timer);
-          } else {
-            staleCount++;
-            if (staleCount >= 4) {
-              // 20s 还没写完 → 大概率风控或 mod 本身没中文
-              clearInterval(timer);
+            // 抓过了：内容一致或无中文，都只提示一次，按钮按版本检查状态收起
+            workshop.data = d;
+            if (tk) {
+              const key = d.html_desc_state === 'same'
+                ? 'preview_same_translation' : 'preview_no_translation';
+              showToast(t(key, { name: modName }), 'info', { key: tk });
             }
+            stop(tk);
+          } else if (!st) {
+            // 未入队且未检查过（例如开关关闭/退避中）→ 停止轮询
+            stop(tk);
+          } else {
+            // st 存在但既没 updated 也没 html_checked（理论上不该发生）→ 停止
+            stop(tk);
           }
         } catch (e) { /* 网络波动，下次再试 */ }
-      }, 5000);
+        finally { busy = false; }
+      };
+      const timer = setInterval(tick, 5000);
+      tick();
     }
 
     function openWsMenu(e) {
@@ -967,6 +1311,7 @@ const app = createApp({
     /** 双击路由：所有副本统一启/停（活动/非活动副本选择逻辑已于 2026-10 删除） */
     function dblClickHandler(m) {
       if (!m || m.__ph) return;
+      // workshop 副本可以精确启停（改 save 文件不动 manifest），不拦截
       toggle(m);  // 所有副本直接启停，按 source 粒度独立
     }
 
@@ -989,21 +1334,27 @@ const app = createApp({
 
       try {
         _localRecheckDeps();
-        const srcLabel = (m.source_label || m.source || '').toLowerCase();
-        showToast(t(enable ? 'enabled_toast' : 'disabled_toast', { name: canonical.name }) + 
-                  (canonical.all_versions && canonical.all_versions.length > 1 ? ` (${srcLabel})` : ''));
+        // workshop 副本和 local 副本用不同 toast——workshop 是改 save 文件（工坊状态），local 是搬目录
+        const isWs = !!m.workshop_id;
+        const toastKey = enable
+          ? (isWs ? 'enabled_toast_workshop' : 'enabled_toast')
+          : (isWs ? 'disabled_toast_workshop' : 'disabled_toast');
+        showToast(t(toastKey, { name: canonical.name }), 'success');
 
         // 2026-10 关键：传 version_key 精确操作物理副本
         const s = await api().set_enabled(canonical.id, enable, null, targetKey);
         applyState(s);
         _localRecheckDeps();
+        // 2026-11-05: toggle 不经过 select()，必须手动清空多选
+        console.log('[DEBUG toggle after apply] multiSelected before clear=', JSON.stringify(multiSelected.value));
+        _multiClear();
         // 选中保持当前点击的副本
         const flatAfter = expandModList([...state.enabled, ...state.disabled]);
         const findM = flatAfter.find(x => x.__version_key === targetKey);
         selected.value = findM || canonical;
       } catch (err) {
         console.error('[toggle] 失败:', err);
-        showToast('操作失败: ' + (err.message || err));
+        showToast('操作失败: ' + (err.message || err), 'error');
         api().get_state().then(s => applyState(s)).catch(() => {});
       }
     }
@@ -1168,18 +1519,18 @@ const app = createApp({
       if (!selected.value) return;
       if (action === 'unpin') {
         const r = await api().unpin_mod(selected.value.id);
-        if (r.ok) { selected.value.pinned = null; _syncSelectedToList(selected.value.id); showToast('已解锁'); }
+        if (r.ok) { selected.value.pinned = null; _syncSelectedToList(selected.value.id); showToast('已解锁', 'success'); }
         return;
       }
       if (action === 'version') {
         if (selected.value.pinned) {
           // 已锁 → 解锁
           const r = await api().unpin_mod(selected.value.id);
-          if (r.ok) { selected.value.pinned = null; _syncSelectedToList(selected.value.id); showToast('已解锁'); }
+          if (r.ok) { selected.value.pinned = null; _syncSelectedToList(selected.value.id); showToast('已解锁', 'success'); }
         } else {
           // 未锁 → 锁当前版本
           const r = await api().pin_mod(selected.value.id, true, false);
-          if (r.ok) { selected.value.pinned = r.pinned; _syncSelectedToList(selected.value.id); showToast('已锁定版本'); }
+          if (r.ok) { selected.value.pinned = r.pinned; _syncSelectedToList(selected.value.id); showToast('已锁定版本', 'success'); }
         }
       }
     }
@@ -1187,7 +1538,7 @@ const app = createApp({
     // P0: 导出 CSV/Markdown → 浏览器下载
     async function doExport(format) {
       const r = await api().export_profile(format);
-      if (!r.ok) { showToast('导出失败'); return; }
+      if (!r.ok) { showToast('导出失败', 'error'); return; }
       const mime = format === 'csv' ? 'text/csv' : 'text/markdown';
       const blob = new Blob([r.data], { type: mime + ';charset=utf-8' });
       const url = URL.createObjectURL(blob);
@@ -1198,21 +1549,21 @@ const app = createApp({
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      showToast(`已导出 ${r.filename}`);
+      showToast(`已导出 ${r.filename}`, 'success');
     }
 
     async function autoSort() {
       const s = await api().auto_sort();
       applyState(s);
-      showToast(t('sort_done'));
+      showToast(t('sort_done'), 'success');
     }
 
     async function save() {
       const r = await api().save_all();
       if (r && r.ok) {
-        showToast(t('save_done'));
+        showToast(t('save_done'), 'success');
       } else {
-        showToast((r && r.errors && r.errors.join('; ')) || '保存失败');
+        showToast((r && r.errors && r.errors.join('; ')) || '保存失败', 'error');
       }
     }
 
@@ -1293,7 +1644,7 @@ const app = createApp({
       const s = await api().load_pack(pack.id);
       if (s && s.ok) {
         applyState(s);
-        showToast(t('loaded_pack', { name: pack.name }));
+        showToast(t('loaded_pack', { name: pack.name }), 'success');
       } else if (s && s.error) {
         alert(t('load_failed') + s.error);
       }
@@ -1340,14 +1691,38 @@ const app = createApp({
     }
     function closeBackupMenu() { backupMenu.show = false; }
 
+    // 全量备份期间轮询后端进度（确定进度：processed/total）
+    function startBackupProgressPolling() {
+      let stopped = false;
+      const tick = async () => {
+        if (stopped) return;
+        try {
+          const p = await api().get_backup_progress();
+          if (!p || !p.total) return;
+          backupBusy.total = p.total;
+          backupBusy.done = (p.processed != null) ? p.processed : ((p.done || 0) + (p.failed || 0));
+          backupBusy.mode = 'determinate';
+        } catch (_) {}
+      };
+      tick();
+      const timer = setInterval(tick, 200);
+      return () => {
+        stopped = true;
+        clearInterval(timer);
+      };
+    }
+
     async function backupMod(m) {
       if (!m) return;
       menu.show = false;
       backupBusy.show = true;
+      backupBusy.mode = 'indeterminate';
+      backupBusy.done = 0;
+      backupBusy.total = 0;
       backupBusy.text = t('backing_up') + (m.name || '');
       try {
         const s = await api().backup_mod(m.id);
-        if (s && s.ok) showToast(t('backup_done', { name: m.name }));
+        if (s && s.ok) showToast(t('backup_done', { name: m.name }), 'success');
         else alert(t('backup_failed') + (s && s.error ? s.error : ''));
         if (s && s.backups) { state.backups = s.backups; state.backup_stats = s.stats || state.backup_stats; }
       } catch (e) {
@@ -1360,15 +1735,28 @@ const app = createApp({
     async function backupAll(scope) {
       if (scope === 'all' && !confirm(t('confirm_backup_all'))) return;
       backupBusy.show = true;
+      backupBusy.mode = 'indeterminate';
+      backupBusy.done = 0;
+      backupBusy.total = 0;
       backupBusy.text = scope === 'enabled' ? t('backing_up_enabled') : t('backing_up_all');
+      const stopPolling = startBackupProgressPolling();
       try {
         const s = await api().backup_all(scope || 'all');
         if (s && s.backups) { state.backups = s.backups; state.backup_stats = s.stats || state.backup_stats; }
-        if (s && s.ok) showToast(t('backup_all_done', { done: s.done, failed: s.failed }));
+        if (s && s.ok) {
+          showToast(
+            t('backup_all_done', { done: s.done, failed: s.failed }),
+            (s.failed || 0) > 0 ? 'warning' : 'success'
+          );
+        }
       } catch (e) {
         alert(t('backup_failed') + (e && e.message ? e.message : e));
       } finally {
+        stopPolling();
         backupBusy.show = false;
+        backupBusy.mode = 'indeterminate';
+        backupBusy.done = 0;
+        backupBusy.total = 0;
       }
     }
 
@@ -1390,15 +1778,26 @@ const app = createApp({
       if (!b || restoreDlg.busy) return;
       restoreDlg.busy = true;
       backupBusy.show = true;
+      backupBusy.mode = 'indeterminate';
+      backupBusy.done = 0;
+      backupBusy.total = 0;
       backupBusy.text = t('restoring');
       try {
         const s = await api().restore_backup(b.id, target);
         if (s && s.ok) {
-          showToast(t('restore_done'));
+          applyState(s);
           if (s.backups) { state.backups = s.backups; state.backup_stats = s.stats || state.backup_stats; }
           closeRestore();
-          const st = await api().get_state();
-          applyState(st);
+          // B1 + B4：用后端返回的 scan_report 只列非零项（定论方案）
+          const rep = s.scan_report || {};
+          const parts = [];
+          if (rep.new) parts.push(t('restore.done.new', { n: rep.new }));
+          if (rep.updated) parts.push(t('restore.done.overwrite', { n: rep.updated }));
+          if (parts.length) {
+            showToast(t('restore.done.batch') + '：' + parts.join('，'), 'success');
+          } else {
+            showToast(t('restore_done'), 'success');
+          }
         } else {
           alert(t('restore_failed') + (s && s.error ? s.error : ''));
         }
@@ -1416,18 +1815,21 @@ const app = createApp({
       if (!confirm(t('confirm_delete_backup', { name: b.name }))) return;
       const s = await api().delete_backup(b.id);
       if (s && s.backups) { state.backups = s.backups; state.backup_stats = s.stats || state.backup_stats; }
-      showToast(t('backup_deleted'));
+      showToast(t('backup_deleted'), 'success');
     }
 
     async function verifyBackup(b) {
       if (!b) return;
       closeBackupMenu();
       backupBusy.show = true;
+      backupBusy.mode = 'indeterminate';
+      backupBusy.done = 0;
+      backupBusy.total = 0;
       backupBusy.text = t('verifying');
       try {
         const s = await api().verify_backup(b.id);
-        if (s && s.ok) showToast(t('verify_ok', { n: s.files }));
-        else showToast(t('verify_bad') + (s && s.error ? s.error : ''));
+        if (s && s.ok) showToast(t('verify_ok', { n: s.files }), 'success');
+        else showToast(t('verify_bad') + (s && s.error ? s.error : ''), 'warning');
       } finally {
         backupBusy.show = false;
       }
@@ -1459,7 +1861,7 @@ const app = createApp({
         loadBackupSettings({ backup: s.settings || {} });
         if (s.backups) { state.backups = s.backups; state.backup_stats = s.stats || state.backup_stats; }
       }
-      showToast(t('save_done'));
+      showToast(t('save_done'), 'success');
     }
 
     async function loadSkinState() {
@@ -1503,7 +1905,33 @@ const app = createApp({
       if (!confirm(t('confirm_clear_enabled', { n: state.enabled.length }))) return;
       const s = await api().clear_enabled();
       applyState(s);
-      showToast(t('cleared_enabled'));
+      showToast(t('cleared_enabled'), 'success');
+    }
+
+    // 2026-11-05 批量启停：遍历 multiSelected 逐个调精确 set_enabled
+    async function batchSetEnabled(enable) {
+      const count = multiSelected.value.length;
+      if (!count) { showToast(t('no_multi_selected'), 'warning'); return; }
+      const verb = enable ? t('batch_enable_verb') : t('batch_disable_verb');
+      if (!confirm(t('confirm_batch_enable', { verb, n: count }))) return;
+      const allFlat = expandModList([...state.enabled, ...state.disabled]);
+      const targets = allFlat.filter(m => _multiHas(m.__version_key) && !m.workshop_id);
+      let ok = 0, fail = 0;
+      for (const m of targets) {
+        try {
+          const r = await api().set_enabled(m.id, enable, m.__version_key);
+          if (r.ok) ok++; else fail++;
+        } catch (e) { fail++; }
+      }
+      // 最后 applyState 一次（只在循环结束后）
+      const lastState = await api().get_state();
+      applyState(lastState);
+      _multiClear();
+      if (fail === 0) {
+        showToast(t('batch_done_all', { verb, n: ok }), 'success');
+      } else {
+        showToast(t('batch_done_partial', { verb, ok, fail }), 'warning');
+      }
     }
 
     // ------------------------------------------------------------------ 游戏版本 & Beta 分支
@@ -1536,24 +1964,24 @@ const app = createApp({
       try {
         console.log('[setAppBeta] 点击分支:', branch);
         betaSwitching.value = true;
-        showToast(t('beta_switching', { branch: branch }));
+        showToast(t('beta_switching', { branch: branch }), 'info');
         const result = await api().set_app_beta(branch);
         console.log('[setAppBeta] 后端返回:', JSON.stringify(result));
         if (result.ok) {
           // 不重启 Steam！瞬间返回
-          showToast(result.note || 'Steam 已开始下载...');
+          showToast(result.note || 'Steam 已开始下载...', 'info');
           _startStatusPolling();  // 开始轮询下载状态
           await refresh(true);    // 刷新 mod 列表（毫秒级）
         } else {
           if (result.error === 'game_running') {
-            showToast(t('beta_switch_game_running'));
+            showToast(t('beta_switch_game_running'), 'warning');
           } else {
-            showToast(t('beta_switch_failed') + ': ' + (result.message || result.error));
+            showToast(t('beta_switch_failed') + ': ' + (result.message || result.error), 'error');
           }
         }
       } catch (e) {
         console.error('[setAppBeta] 异常:', e);
-        showToast(t('beta_switch_failed') + ': ' + (e && e.message || e));
+        showToast(t('beta_switch_failed') + ': ' + (e && e.message || e), 'error');
       } finally {
         betaSwitching.value = false;
       }
@@ -1602,7 +2030,7 @@ const app = createApp({
         savesManager.profiles = slots.profiles || [];
         savesManager.backups = (bk && bk.profiles) || [];
       } catch (e) {
-        showToast(t('saves_load_failed') + ': ' + e.message);
+        showToast(t('saves_load_failed') + ': ' + e.message, 'error');
       } finally {
         savesManager.busy = false;
       }
@@ -1613,13 +2041,13 @@ const app = createApp({
       try {
         const r = await api().backup_save_slot(profileNum, kind);
         if (r.ok) {
-          showToast(t('saves_backup_ok'));
+          showToast(t('saves_backup_ok'), 'success');
           await loadSavesList();
         } else {
-          showToast(t('saves_backup_failed') + ': ' + r.error);
+          showToast(t('saves_backup_failed') + ': ' + r.error, 'error');
         }
       } catch (e) {
-        showToast(t('saves_backup_failed') + ': ' + e.message);
+        showToast(t('saves_backup_failed') + ': ' + e.message, 'error');
       }
     }
 
@@ -1628,13 +2056,13 @@ const app = createApp({
       try {
         const r = await api().restore_save_slot(profileNum, kind, backupPath);
         if (r.ok) {
-          showToast(t('saves_restore_ok'));
+          showToast(t('saves_restore_ok'), 'success');
           await loadSavesList();
         } else {
-          showToast(t('saves_restore_failed') + ': ' + r.error);
+          showToast(t('saves_restore_failed') + ': ' + r.error, 'error');
         }
       } catch (e) {
-        showToast(t('saves_restore_failed') + ': ' + e.message);
+        showToast(t('saves_restore_failed') + ': ' + e.message, 'error');
       }
     }
 
@@ -1655,14 +2083,14 @@ const app = createApp({
             // 之前检测到运行过，现在消失了 → 闪退，回到 idle
             launchState.value = 'idle';
             clearInterval(timer);
-            showToast('游戏启动后立即退出，请检查游戏日志');
+            showToast('游戏启动后立即退出，请检查游戏日志', 'error');
           }
           // 超时兜底
           if (Date.now() - startedAt > 45000) {
             clearInterval(timer);
             if (launchState.value === 'launching') {
               launchState.value = 'idle';
-              showToast('启动超时（45秒），请检查 Steam 是否正常运行');
+              showToast('启动超时（45秒），请检查 Steam 是否正常运行', 'error');
             }
           }
         } catch (e) {
@@ -1734,6 +2162,7 @@ const app = createApp({
     // === 拖拽系统（flat idx 语义）===
     function onDragStart(e, idx, m, whichList) {
       if (e.button !== 0) return;
+      // workshop 副本可以精确启停（改 save 文件），允许拖拽
       drag.active = true;
       drag.fromList = whichList; // 'enabled' 或 'disabled'
       drag.targetList = whichList; // 初始默认 = 起始列表
@@ -1874,13 +2303,17 @@ const app = createApp({
         } else {
           targetCanonicalIdx = enabledArr.length; // 追加到末尾
         }
-        // 后端：先启用再重排
-        await api().set_enabled(fromModId, true);
+        // 后端：先启用再重排（必须传 version_key 精确操作物理副本）
+        await api().set_enabled(fromModId, true, null, fromMod.__version_key);
         const newState = await api().get_state();
         applyState(newState);
         // applyState 后从新的 state.enabled 里找到刚启用的 mod
         const freshEnabled = [...state.enabled];
         const justEnabledIdx = freshEnabled.findIndex(c => c.id === fromModId);
+        // workshop 副本和 local 副本用不同 toast
+        const dragIsWs = !!fromMod.workshop_id;
+        const dragEnableKey = dragIsWs ? 'enabled_toast_workshop' : 'enabled_toast';
+        const dragDisableKey = dragIsWs ? 'disabled_toast_workshop' : 'disabled_toast';
         if (justEnabledIdx >= 0 && justEnabledIdx !== targetCanonicalIdx) {
           const moved = freshEnabled.splice(justEnabledIdx, 1)[0];
           let finalTo = targetCanonicalIdx;
@@ -1890,19 +2323,21 @@ const app = createApp({
           state.enabled = freshEnabled;
           await api().reorder_enabled(freshEnabled.map(m => m.id));
           _localRecheckDeps();
-          showToast(`已启用 ${fromMod?.name || fromModId}`);
+          showToast(t(dragEnableKey, { name: fromMod?.name || fromModId }), 'success');
         } else {
-          showToast(`已启用 ${fromMod?.name || fromModId}`);
+          showToast(t(dragEnableKey, { name: fromMod?.name || fromModId }), 'success');
         }
         return;
       }
 
       if (fromList === 'enabled' && targetList === 'disabled') {
-        // —— B) 停用 ——
-        await api().set_enabled(fromModId, false);
+        // —— B) 停用（必须传 version_key 精确操作物理副本）——
+        const dragIsWs = !!fromMod.workshop_id;
+        const dragDisableKey = dragIsWs ? 'disabled_toast_workshop' : 'disabled_toast';
+        await api().set_enabled(fromModId, false, null, fromMod.__version_key);
         const newState = await api().get_state();
         applyState(newState);
-        showToast(`已停用 ${fromMod?.name || fromModId}`);
+        showToast(t(dragDisableKey, { name: fromMod?.name || fromModId }), 'success');
         return;
       }
 
@@ -1969,25 +2404,28 @@ const app = createApp({
       }
 
       if (enabledSearch.value.trim()) {
-        showToast('已在当前搜索范围内重排');
+        showToast('已在当前搜索范围内重排', 'success');
       }
 
       api().reorder_enabled(enabledArr.map(m => m.id)).then(() => {
         api().get_state().then(s => applyState(s)).catch(() => {});
       }).catch(err => {
         console.error('[drag] reorder failed:', err);
-        showToast('排序保存失败，请检查后端日志');
+        showToast('排序保存失败，请检查后端日志', 'error');
         api().get_state().then(s => applyState(s)).catch(() => {});
       });
     }
 
     async function openMenu(e, m) {
+      // workshop 副本可以精确启停，允许弹右键菜单
       menu.mod = m;
       menu.x = e.clientX;
       menu.y = e.clientY;
       // 2026-10：活动/非活动副本区分已删除，右键菜单直接显示启/停
       // 按当前副本 m.is_enabled 判断（方案 B 独立启停）
-      menu.toggleText = m.is_enabled ? t('disable') : t('enable');
+      // 2026-11-05: 如果有多选集合（Ctrl/Shift），toggleText 加 (n) 批量标记
+      const baseText = m.is_enabled ? t('disable') : t('enable');
+      menu.toggleText = (multiSelectedCount.value > 1) ? `${baseText} (${multiSelectedCount.value})` : baseText;
       menu.versions = [];  // available_versions 公开 API 已删除
       menu.show = true;
       await nextTick();
@@ -2105,7 +2543,7 @@ const app = createApp({
       menu.show = false;
       const allList = expandModList([...state.enabled, ...state.disabled]);
       const found = allList.find(x => x.__version_key === targetKey);
-      if (!found) { toast('找不到此副本', 'warn'); return; }
+      if (!found) { showToast('找不到此副本', 'warning'); return; }
       selected.value = found;
       await nextTick();
       const el = document.querySelector(`.mod-item[data-ver-key="${CSS.escape(targetKey)}"]`);
@@ -2123,12 +2561,38 @@ const app = createApp({
     }
 
     async function menuToggle() {
-      const m = menu.mod;
       menu.show = false;
-      // 2026-10：传 __version_key 精确操作物理副本
-      const enable = !m.is_enabled;
-      const s = await api().set_enabled(m.id, enable, null, m.__version_key);
-      applyState(s);
+      if (multiSelectedCount.value > 1) {
+        // 多选批量模式：只对本地副本生效，跳过 workshop（和后端 store_mods.py 批量模式一致）
+        const targetEnable = !menu.mod.is_enabled;
+        const allFlat = expandModList([...state.enabled, ...state.disabled]);
+        const targets = allFlat.filter(m => _multiHas(m.__version_key) && !m.workshop_id);
+        let okCount = 0;
+        for (const m of targets) {
+          try {
+            await api().set_enabled(m.id, targetEnable, null, m.__version_key);
+            okCount++;
+          } catch (err) {
+            console.warn('[menuToggle batch] 单个失败:', m.id, err);
+          }
+        }
+        const s = await api().get_state();
+        applyState(s);
+        _multiClear();
+        const verb = targetEnable ? t('batch_enable') : t('batch_disable');
+        showToast(`${verb}: ${okCount}/${targets.length}`, okCount === targets.length ? 'success' : 'warning');
+      } else {
+        // 单副本模式（原逻辑）
+        const m = menu.mod;
+        const enable = !m.is_enabled;
+        const s = await api().set_enabled(m.id, enable, null, m.__version_key);
+        applyState(s);
+        const isWs = !!m.workshop_id;
+        const toastKey = enable
+          ? (isWs ? 'enabled_toast_workshop' : 'enabled_toast')
+          : (isWs ? 'disabled_toast_workshop' : 'disabled_toast');
+        showToast(t(toastKey, { name: m.name || m.id }), 'success');
+      }
     }
 
     async function refreshWsPreview() {
@@ -2153,14 +2617,14 @@ const app = createApp({
           if (del.workshop) delParts.push('工坊预览缓存');
           const delText = delParts.length ? `已删除 ${delParts.join('、')}` : '无缓存需清理';
           const titlePart = r.title ? `，重抓标题「${r.title}」` : '，重抓标题时未获取到（可能在风控中）';
-          showToast(`${t('preview_refreshed')}：${delText}${titlePart}`);
+          showToast(`${t('preview_refreshed')}：${delText}${titlePart}`, 'success');
         } else if (r && r.error === 'rate_limited') {
-          showToast(t('preview_rate_limited'));
+          showToast(t('preview_rate_limited'), 'warning');
         } else {
-          showToast(t('preview_refresh_failed'));
+          showToast(t('preview_refresh_failed'), 'error');
         }
       } catch (e) {
-        showToast(t('preview_refresh_failed'));
+        showToast(t('preview_refresh_failed'), 'error');
       }
     }
 
@@ -2174,14 +2638,17 @@ const app = createApp({
       const m = menu.mod;
       menu.show = false;
       if (!confirm(t('confirm_delete_mod', { name: m.name, path: m.path || t('unknown_path') }))) return;
-      // 传 version_key = install_dir 精确删用户选中的那个物理副本
       const s = await api().delete_mod(m.id, m.__version_key || null);
-      applyState(s);
-      // 删除物理文件夹后需要重新扫描才能从列表消失
-      const refreshResult = await refresh(true);
-      if (refreshResult) {
-        const r = refreshResult.scan_report || {};
-        showToast(t('scan_done', { total: r.total || 0, new: r.new || 0, updated: r.updated || 0, deleted: r.deleted || 0, known: r.known || 0 }));
+      if (s && s.ok) {
+        applyState(s);
+        // B1 + B3：用后端 partial 区分"全删" vs "部分变更"
+        if (s.partial) {
+          showToast(t('delete.done.partial', { name: m.name || m.id }), 'success');
+        } else {
+          showToast(t('delete.done.single', { name: m.name || m.id }), 'success');
+        }
+      } else {
+        showToast(t('delete_failed'), 'error');
       }
     }
 
@@ -2246,6 +2713,7 @@ const app = createApp({
         manual_mods_dir: s.manual_mods_dir || '',
         manual_save_dir: s.manual_save_dir || '',
         language: (s.language === 'en') ? 'en' : 'zh',
+        workshop_html_fill: s.workshop_html_fill !== false,
       };
       if (s.backup) loadBackupSettings(s);
       settings.show = true;
@@ -2271,7 +2739,7 @@ const app = createApp({
       const refreshing = (r && r.refreshing) || 0;
       showToast(refreshing
         ? t('cache_cleaned_refreshing', { removed, refreshing })
-        : t('cache_cleaned', { removed }));
+        : t('cache_cleaned', { removed }), 'success');
     }
 
     async function clearWorkshopCacheAll() {
@@ -2307,13 +2775,13 @@ const app = createApp({
         }, 200);
       });
       bulkProgress.show = false;
-      showToast(t('cache_clear_all_toast', { refreshing: total }));
+      showToast(t('cache_clear_all_toast', { refreshing: total }), 'success');
     }
 
     async function clearDllCache() {
       if (!confirm(t('dll_cache_confirm'))) return;
       await api().clear_dll_cache();
-      showToast(t('dll_cache_cleared'));
+      showToast(t('dll_cache_cleared'), 'success');
     }
 
     // Steam 工坊更新弹窗
@@ -2383,7 +2851,7 @@ const app = createApp({
         replacementSuggestions.note = r.note || '';
         replacementSuggestions.lastChecked = new Date().toLocaleTimeString();
       } catch (e) {
-        showToast('分析失败: ' + (e.message || e));
+        showToast('分析失败: ' + (e.message || e), 'error');
       } finally {
         replacementChecking.value = false;
       }
@@ -2397,12 +2865,12 @@ const app = createApp({
           steamdbExport.path = r.path;
           steamdbExport.entries = r.entries || 0;
           steamdbExport.with_deps = r.with_deps || 0;
-          showToast(`✅ 已导出 ${r.entries} 条 → ${r.path}`);
+          showToast(`✅ 已导出 ${r.entries} 条 → ${r.path}`, 'success');
         } else {
-          showToast('导出失败: ' + (r.error || '未知错误'));
+          showToast('导出失败: ' + (r.error || '未知错误'), 'error');
         }
       } catch (e) {
-        showToast('导出失败: ' + (e.message || e));
+        showToast('导出失败: ' + (e.message || e), 'error');
       } finally {
         steamdbExport.exporting = false;
       }
@@ -2416,7 +2884,7 @@ const app = createApp({
         mpCompat.stats = r.stats || {};
         mpCompat.lastChecked = new Date().toLocaleTimeString();
       } catch (e) {
-        showToast('联机检测失败: ' + (e.message || e));
+        showToast('联机检测失败: ' + (e.message || e), 'error');
       } finally {
         mpCompat.checking = false;
       }
@@ -2428,7 +2896,7 @@ const app = createApp({
         // 重新扫描以更新显示
         await checkMpCompatibility();
       } catch (e) {
-        showToast('设置失败: ' + (e.message || e));
+        showToast('设置失败: ' + (e.message || e), 'error');
       }
     }
 
@@ -2452,9 +2920,9 @@ const app = createApp({
         const r = await api().clear_workshop_cache_force();
         workshop.data = null;
         workshop.error = '';
-        showToast(`已清除 ${r.cleared || 0} 个工坊缓存`);
+        showToast(`已清除 ${r.cleared || 0} 个工坊缓存`, 'success');
       } catch (e) {
-        showToast('清除失败: ' + (e.message || e));
+        showToast('清除失败: ' + (e.message || e), 'error');
       }
     }
 
@@ -2545,6 +3013,7 @@ const app = createApp({
         settings.form.manual_mods_dir || null,
         settings.form.manual_save_dir || null,
         settings.form.language === 'en' ? 'en' : 'zh',
+        !!settings.form.workshop_html_fill,
       );
       settings.show = false;
       lang.value = settings.form.language === 'en' ? 'en' : 'zh';
@@ -2675,6 +3144,7 @@ const app = createApp({
         if (!e.target.closest('.context-menu')) closeMenu();
         if (!e.target.closest('.ws-menu') && !e.target.closest('.ws-open-btn')) closeWsMenu();
         if (!e.target.closest('.pack-menu')) closePackMenu();
+        if (!e.target.closest('.backup-menu')) closeBackupMenu();
       });
 
       // GUI 环境：等 pywebviewready（后端 API 就绪）后再用真实数据刷新；
@@ -2709,13 +3179,14 @@ const app = createApp({
     console.log('[DIAG] setup() about to return, _relTime exists:', typeof _relTime, 'DEP_AREA:', typeof DEP_AREA);
 
     return {
-      state, breakdown: computed(() => state.breakdown), selected, enabledSearch, disabledSearch, launchText, depLayer, depHeight, depStyle,
+      state, breakdown: computed(() => state.breakdown), selected, multiSelected, multiSelectedCount, batchSetEnabled, enabledSearch, disabledSearch, launchText, depLayer, depHeight, depStyle,
       menuEl, packMenuEl,
-      toasts, dllProgress, bulkProgress, scanProgress,
+      toasts, pauseToast, resumeToast, dismissToast, dllProgress, bulkProgress, scanProgress,
       filteredEnabled, filteredDisabled, selectedMeta, selectedDesc, selectedLocalTags, selectedManagerTags, selectedTagHits, selectedTags,
+      canFetchTranslation, translationHint, translationBusy, fetchCommunityTranslation,
       effectiveDescription, effectivePreview, effectiveTitle, effectiveAuthor,
       subText, tooltip, depWarnTitle, versionLabel,
-      workshop, wsMenu, openWsMenu, closeWsMenu, openWorkshop, previewProgress, bgProgress,
+      workshop, wsMenu, openWsMenu, closeWsMenu, openWorkshop, bgProgress, currentProgressCard, progressTaskCount,
       refresh, select, toggle, autoSort, save, clearEnabled, launch, scan, copyText, doExport, togglePin,
       packMenu, openPackMenu, closePackMenu, sharePack, renamePack, deletePack, loadPack,
       packTab, skin, loadSkinState, setSkinActive, card, loadCardState, setCardActive,

@@ -80,6 +80,8 @@ class Api:
         self.manager = manager
         # 上次扫描快照（lower mod_id -> version）。None 表示尚无基线（首次扫描）。
         self._last_snapshot: Optional[dict] = None
+        # refresh 启动互斥：避免两次 API 调用在 running 标志写入前同时通过检查
+        self._refresh_start_lock = threading.Lock()
         # 从 godot.log 解析出的 mod 子内容缓存：{mod_id: {"initializers": [...], "creatings": [...]}}
         self._cached_subcontents: dict = {}
         # 备份管理器（按备份根目录懒创建；目录变了自动重建）
@@ -94,6 +96,12 @@ class Api:
         self._titles_pending_cache: dict[str, int] = {}
         # 后台两阶段完整补全：阶段1 Web API快速预览图 → 阶段2慢速HTML补中文
         self._bg_fill_thread: Optional[threading.Thread] = None
+        # 全量备份进度（线程安全，供前端轮询）
+        self._backup_progress = {
+            "running": False, "total": 0, "processed": 0,
+            "done": 0, "failed": 0, "skipped": 0,
+        }
+        self._backup_progress_lock = threading.Lock()
 
     def _ui(self, key: str) -> str:
         """按当前界面语言返回内置文案。"""
@@ -415,9 +423,9 @@ class Api:
         src_states = self.manager._source_states.get(active.mod_id.lower(), {})
         src_toggled = self.manager._source_last_toggled.get(active.mod_id.lower(), {})
         results: list[dict] = []
-        for v in self.manager.available_versions(active.mod_id):
-            # 2026-11-01 多副本修复：workshop 副本用 ws_{workshop_id} 唯一 key
-            v_state_key = f"ws_{v.workshop_id}" if v.workshop_id else v.source
+        versions_list = self.manager.available_versions(active.mod_id)
+        for v in versions_list:
+            v_state_key = mod_version_key(v)
             # 每个副本独立的显示名：Steam workshop title > mod.json name
             v_display_name = v.display_name
             if v.source == "workshop" and v.workshop_id:
@@ -540,20 +548,18 @@ class Api:
         """启动后台线程执行扫描，立刻返回。前端通过 get_scan_progress 轮询进度和结果。"""
 
         # 防止用户连续点两次 refresh（或上次异常退出 running 残留）
-        prog = self.get_scan_progress()
-        if prog.get("running"):
-            return {"ok": False, "error": "scan_already_running"}
+        from .scanner import _scan_progress, _scan_progress_lock
 
         def _run():
-            from .scanner import finish_scan_progress, set_scan_stage, _scan_progress, _scan_progress_lock
-            # 在后台线程开头显式把 running 设 True（reset_scan_progress 不再碰 running 标志，
-            # 因为 store.refresh 会在 main.py 同步先跑一次）
-            with _scan_progress_lock:
-                _scan_progress["running"] = True
+            from .scanner import finish_scan_progress, set_scan_stage
             try:
                 _log.info("[api] refresh (async) start")
                 set_scan_stage("scan_mods")
                 self._titles_pending_cache.clear()
+                # A6：旧格式快照 {mod_id: version} 检测 → 直接重建
+                if self._is_old_snapshot_format(self._last_snapshot):
+                    _log.info("[api] 检测到旧格式快照，强制重建为 {(mod_id, install_dir): version}")
+                    self._last_snapshot = self._rebuild_snapshot()
                 before = self._last_snapshot
                 self.manager.refresh()
                 # 启动后台两阶段补全（Web API 快速预览图 → 慢速 HTML 补中文）
@@ -600,29 +606,73 @@ class Api:
                 _log.exception("[api] refresh (async) error: %s", e)
                 finish_scan_progress(error=str(e))
 
-        # 防止用户连续点两次 refresh
-        prog = self.get_scan_progress()
-        if prog.get("running"):
-            return {"ok": False, "error": "scan_already_running"}
-
-        threading.Thread(target=_run, daemon=True).start()
+        # 同一时刻只允许一个 refresh 启动；running 在起线程前写入，关闭检查/写入之间的竞态
+        with self._refresh_start_lock:
+            if self.get_scan_progress().get("running"):
+                return {"ok": False, "error": "scan_already_running"}
+            with _scan_progress_lock:
+                _scan_progress["running"] = True
+            try:
+                threading.Thread(target=_run, daemon=True).start()
+            except Exception:
+                with _scan_progress_lock:
+                    _scan_progress["running"] = False
+                raise
         return {"running": True}
 
     def _snapshot(self) -> dict:
-        """当前所有 mod 的 {lower mod_id: version} 快照。"""
-        return {mid: info.manifest.version for mid, info in self.manager.all_mods.items()}
+        """当前所有物理副本的 {(lower mod_id, version_key): version} 快照。
+
+        2026-11-04：从 {mod_id: version} 改为 {(mod_id, version_key): version}。
+        多副本 mod（如同时有 workshop + local 版本）删一个副本后，
+        旧逻辑因为 mod_id 还存在所以算不出 deleted；
+        新逻辑按物理副本粒度跟踪，每个 install_dir 独立统计。
+        """
+        snap: dict = {}
+        for low, info in self.manager.all_mods.items():
+            versions = self.manager._mod_versions.get(low, [])
+            if versions:
+                for v in versions:
+                    vk = str(v.install_dir) if v.install_dir else ''
+                    if vk:
+                        snap[(low, vk)] = v.manifest.version or ''
+            # fallback：没 _mod_versions 时用 canonical info
+            vk = str(info.install_dir) if info.install_dir else ''
+            if vk and (low, vk) not in snap:
+                snap[(low, vk)] = info.manifest.version or ''
+        return snap
+
+    def _is_old_snapshot_format(self, snap) -> bool:
+        """判断快照是否为旧格式 {mod_id: version}（字符串键，单值）。"""
+        if not snap:
+            return False
+        for k in snap.keys():
+            if isinstance(k, tuple) and len(k) == 2:
+                return False   # 新格式: (mod_id, install_dir)
+            return True        # 旧格式: "mod_id"
+        return False
+
+    def _rebuild_snapshot(self) -> dict:
+        """强制重建快照为新格式（丢弃旧格式的 in-memory _last_snapshot）。"""
+        return self._snapshot()
 
     def _scan_report(self, before: Optional[dict], after: dict) -> dict:
-        """对比前后两次扫描，统计新增 / 更新 / 删除。"""
-        enabled = len(self.manager.ordered_enabled())
-        disabled = len(self.manager.ordered_disabled())
-        total = enabled + disabled
-        # 2026-10-15：即使 before is None（首次扫描），也要把 ghost_removed 算进 deleted
-        # 否则用户手动删 mod 后点刷新，前端永远显示"无删除"
+        """对比前后两次扫描，统计新增 / 更新 / 删除（物理副本粒度）。
+
+        注意：
+        - total = len(after)，和 diff 同粒度（物理副本数，非 mod_id 数）
+        - "更新"只比 version 字段；内容变了但 version 没变检测不到
+        - mod_deleted 是内部统计，UI 不直接消费（定论 #8）
+        """
+        total = len(after)
+
+        # 2026-10-15：ghost_removed（残留目录清理）也算 deleted
         ghost_deleted = getattr(self.manager, '_last_ghost_removed', 0) or 0
+
         if before is None:
-            # 首次扫描，没有基线，不把现有 mod 都算作「新增」，但 ghost 要算 deleted
-            return {"total": total, "new": 0, "updated": 0, "deleted": ghost_deleted, "known": total + ghost_deleted}
+            # 首次扫描：没有基线，不算现有 mod 为 new，但 ghost 要算 deleted
+            return {"total": total, "new": 0, "updated": 0,
+                    "deleted": ghost_deleted, "known": total + ghost_deleted}
 
         new = sum(1 for k in after if k not in before)
         deleted = sum(1 for k in before if k not in after)
@@ -630,12 +680,18 @@ class Api:
             1 for k in after
             if k in before and (after.get(k) or "") != (before.get(k) or "")
         )
+        # mod_id 级别的聚合（内部用，UI 不直接暴露）
+        before_ids = {k[0] for k in before}
+        after_ids = {k[0] for k in after}
+        mod_deleted = len(before_ids - after_ids)
+
         return {
             "total": total,
-            "new": new,
-            "updated": updated,
-            "deleted": deleted,
-            "known": total + deleted,
+            "new": new,           # 物理副本级新增
+            "updated": updated,   # 物理副本级版本变化
+            "deleted": deleted + ghost_deleted,  # 物理副本级删除 + ghost
+            "mod_deleted": mod_deleted,   # 整个 mod_id 消失（内部用）
+            "known": total + deleted + ghost_deleted,
         }
 
     def clear_workshop_cache(self) -> dict:
@@ -729,7 +785,7 @@ class Api:
             reset_workshop_progress(len(ws_ids))
             for ws_id in ws_ids:
                 try:
-                    fetch_workshop_preview(ws_id, language)
+                    fetch_workshop_preview(ws_id, language, _skip_html=True)
                 except Exception:
                     pass
                 finally:
@@ -745,8 +801,13 @@ class Api:
         from .scanner import get_scan_progress as _gsp
         return _gsp()
 
+    def get_backup_progress(self) -> dict:
+        """返回全量备份进度（total/processed/done/failed/skipped），供前端轮询。"""
+        with self._backup_progress_lock:
+            return dict(self._backup_progress)
+
     def get_workshop_cache_progress(self) -> dict:
-        """返回批量重新下载预览的进度（done/total），供前端右上角进度条轮询。"""
+        """返回批量重新下载预览的进度（done/total），供正下方进度条轮询。"""
         from .workshop import get_workshop_progress
 
         return get_workshop_progress()
@@ -2299,6 +2360,30 @@ class Api:
             "running": running,
         }
 
+    def get_html_tasks(self) -> dict:
+        """统一 HTML 队列的任务状态（供前端轻量轮询）。
+
+        返回 {items: {wid: {status, reason, seq, updated_at}}, pending: [wid], seq, circuit_open}
+        status: queued / running / done / failed
+        """
+        from .workshop import get_html_tasks
+        return get_html_tasks()
+
+    def request_workshop_translation(self, mod_id: str) -> dict:
+        """用户手动触发：绕过中文占比门控，抓一次社区页中文描述。
+
+        只对当前选中 mod 生效，不自动重试；完成后前端轮询 get_html_tasks 刷新预览。
+        """
+        from .workshop import ensure_html
+
+        info = self.manager.active_version(str(mod_id))
+        if info is None or info.source != "workshop" or not info.workshop_id:
+            return {"ok": False, "error": "not_workshop"}
+        lang = self.manager.get_language()
+        res = ensure_html(str(info.workshop_id), lang, reason="manual", force=True)
+        status = res.get("status")
+        return {"ok": status in ("queued", "running", "cached"), **res}
+
     def set_enabled(
         self, mod_id: str, enable: bool,
         source: Optional[str] = None, version_key: Optional[str] = None,
@@ -2328,6 +2413,21 @@ class Api:
                 _log.warning("[api] set_enabled %s → %s 后端拒绝（可能被 pinned 或找不到），前端将收到未变更状态",
                              mod_id, enable)
             self.manager.recheck_dependencies()
+            # 启用入口：把该工坊 mod 的 HTML 补全（依赖 + 中文描述）放进统一队列，
+            # 不阻塞当前返回；失败只记 debug，不影响启停结果
+            if ok and enable:
+                try:
+                    from .workshop import ensure_html
+                    if version_key:
+                        info = self.manager._find_by_key(str(version_key))
+                    else:
+                        info = self.manager._find(
+                            str(mod_id), source=str(source) if source else None
+                        )
+                    if info is not None and info.workshop_id:
+                        ensure_html(str(info.workshop_id), reason="enable")
+                except Exception as e:
+                    _log.debug("[api] set_enabled 入队 HTML 任务失败: %s", e)
             state = self.get_state()
             state["toggle_ok"] = ok
             return state
@@ -2496,9 +2596,14 @@ class Api:
         无论启用/停用/本地，只要有 workshop_id 就查 Steam。"""
         from .workshop import fetch_workshop_preview as _fetch
 
-        info = self.manager.active_version(str(mod_id))
-        # P1: 不再限制 source="workshop" —— 停用 source="disabled" 也能查 Steam
-        if info is None or not info.workshop_id:
+        # 2026-11-04: 从 _mod_versions 找有 workshop_id 的副本（多副本场景下 active_version 可能返回 local 副本）
+        mid_lower = str(mod_id).lower()
+        info = None
+        for v in self.manager._mod_versions.get(mid_lower, []):
+            if v.workshop_id:
+                info = v
+                break
+        if info is None:
             return {}
         result = _fetch(info.workshop_id, self.manager.get_language())
         if result is None:
@@ -2545,10 +2650,15 @@ class Api:
         from .workshop import _clear_api_fail
 
         _log.info("[api] refresh_workshop_preview 入口: mod_id=%s", mod_id)
-        info = self.manager.active_version(str(mod_id))
-        if info is None or not info.workshop_id:
-            _log.warning("[api] refresh_workshop_preview 早退: info=%s workshop_id=%s",
-                         info, info.workshop_id if info else None)
+        # 2026-11-04: 从 _mod_versions 里找有 workshop_id 的副本（多副本场景下 active_version 可能返回 local 副本）
+        mid_lower = str(mod_id).lower()
+        info = None
+        for v in self.manager._mod_versions.get(mid_lower, []):
+            if v.workshop_id:
+                info = v
+                break
+        if info is None:
+            _log.debug("[api] refresh_workshop_preview 跳过: mod_id=%s（无 workshop 副本）", mod_id)
             return {"ok": False, "error": "no_workshop_id"}
 
         wid = str(info.workshop_id)
@@ -2585,10 +2695,33 @@ class Api:
                 "title": title, "workshop_id": wid}
 
     def delete_mod(self, mod_id: str, version_key: Optional[str] = None) -> dict:
+        """删除 mod 的某个物理副本（或整个 mod_id）。
+
+        2026-11-04：定论方案。
+        - partial = 删之前同 mod_id 的副本数 > 1（**先算后 pop**，定论细节 1）
+        - 局部更新 _last_snapshot：pop((mod_id, install_dir), None)
+        - 不动 set_enabled 类的启停（定论：启停不动快照）
+        - 返回 {ok, partial, state}，前端用 partial 区分"全删/部分变更"
+        """
         def _do():
-            ok = self.manager.delete_mod(str(mod_id), version_key=str(version_key) if version_key else None)
-            self.manager.refresh()
-            return {"ok": ok, **self.get_state()}
+            mod_id_low = str(mod_id).lower()
+            vk = str(version_key) if version_key else None
+            # 1) 先算 partial：删之前，同 mod_id 在 _last_snapshot 里有几个物理副本
+            #    必须在 pop 之前算，否则逻辑反了（定论细节 1）
+            remaining_before = [k for k in (self._last_snapshot or {}) if k[0] == mod_id_low]
+            partial = len(remaining_before) > 1  # 2+ 副本 → 删一个还剩其他
+
+            ok = self.manager.delete_mod(str(mod_id), version_key=vk)
+            if ok:
+                # 2) 局部更新 _last_snapshot（只 pop 被删的那个副本，不跑全量 diff）
+                if self._last_snapshot is not None and vk:
+                    self._last_snapshot.pop((mod_id_low, vk), None)
+                self.manager.refresh()  # store 重建，清理 delete_mod 后的残留引用
+                _log.info("[api] delete_mod 成功: mod_id=%s, version_key=%s, partial=%s, snapshot 已同步",
+                          mod_id_low, vk, partial)
+            else:
+                _log.warning("[api] delete_mod 后端拒绝: mod_id=%s, version_key=%s", mod_id_low, vk)
+            return {"ok": ok, "partial": partial, **self.get_state()}
         return _do()
 
     def clear_enabled(self) -> dict:
@@ -2644,7 +2777,7 @@ class Api:
         """获取（或按当前备份目录重建）BackupManager。"""
         root = str(self.manager.backup_root)
         if self._backups is None or self._backups_root != root:
-            self._backups = BackupManager(self.manager.backup_root)
+            self._backups = BackupManager(self.manager.backup_root, data_root=self.manager.data_dir)
             self._backups_root = root
         self._backups.keep_versions = int(self.manager.state().keep_versions)
         return self._backups
@@ -2687,25 +2820,43 @@ class Api:
                 infos = self.manager.ordered_enabled()
             else:
                 infos = list(self.manager.ordered_enabled()) + list(self.manager.ordered_disabled())
+            candidates = [i for i in infos if i.install_dir is not None]
+            skipped = len(infos) - len(candidates)
             mgr = self._bkmgr()
-            done, failed, skipped = 0, 0, 0
+            done, failed = 0, 0
             errors: list[str] = []
-            for info in infos:
-                if info.install_dir is None:
-                    skipped += 1
-                    continue
-                try:
-                    mgr.create(info, kind="manual")
-                    done += 1
-                except Exception as e:
-                    failed += 1
-                    errors.append(f"{info.display_name}: {e}")
-                    _log.warning("[api] backup_all 失败 %s: %s", info.mod_id, e)
+            with self._backup_progress_lock:
+                self._backup_progress.update({
+                    "running": True, "total": len(candidates), "processed": 0,
+                    "done": 0, "failed": 0, "skipped": skipped,
+                })
+            try:
+                for info in candidates:
+                    try:
+                        mgr.create(info, kind="manual")
+                        done += 1
+                    except Exception as e:
+                        failed += 1
+                        errors.append(f"{info.display_name}: {e}")
+                        _log.warning("[api] backup_all 失败 %s: %s", info.mod_id, e)
+                    finally:
+                        with self._backup_progress_lock:
+                            self._backup_progress.update({
+                                "processed": done + failed, "done": done, "failed": failed,
+                            })
+            finally:
+                with self._backup_progress_lock:
+                    self._backup_progress["running"] = False
             return {
                 "ok": True, "done": done, "failed": failed, "skipped": skipped,
                 "errors": errors[:10], **self.list_backups(),
             }
 
+        with self._backup_progress_lock:
+            self._backup_progress.update({
+                "running": False, "total": 0, "processed": 0,
+                "done": 0, "failed": 0, "skipped": 0,
+            })
         return self._dispatch_async(_do, f"backup_all({scope})")
 
     def delete_backup(self, backup_id: str) -> dict:
@@ -2725,7 +2876,13 @@ class Api:
 
     def restore_backup(self, backup_id: str, target: str = "workshop") -> dict:
         """还原备份（异步）。target: workshop（回工坊目录）/ local（解包到 .mods_disabled/ 停用文件夹）。
-        2026-10-13：local 从 Mods/ 改为 .mods_disabled/，还原后默认停用更安全。"""
+
+        2026-11-04：定论方案。
+        - before 必须是拷贝（dict(_last_snapshot)），防止可变对象被后续修改导致 diff 失真
+        - 首次启动 _last_snapshot 为空时，先跑一次基线快照作为 before，避免把所有已有 mod 算成新增
+        - 还原成功后：store 刷新 → after = _snapshot() → 算 scan_report → 同步 _last_snapshot = after
+        - 返回 {restore_result, scan_report, state}，前端直接消费，不调全量 refresh
+        """
         def _do():
             rec = self._bkmgr().get(str(backup_id))
             if rec is None:
@@ -2734,7 +2891,6 @@ class Api:
             if str(target) == "local":
                 if game is None or game.disabled_dir is None:
                     return {"ok": False, "error": self._ui("folder_missing"), **self.list_backups()}
-                # 2026-10-13 修复：还原备份默认到停用文件夹 (.mods_disabled/)，而非 Mods/
                 dest = game.disabled_dir / str(rec.get("name") or rec.get("mod_id") or "mod")
             else:
                 ws_id = rec.get("workshop_id")
@@ -2744,8 +2900,32 @@ class Api:
                     dest = Path(str(rec["origin_dir"]))
                 else:
                     return {"ok": False, "error": self._ui("folder_missing"), **self.list_backups()}
+            # 1) before 用拷贝（定论：before 不能是引用，否则 after 赋值时会污染 diff）
+            #    首次启动 _last_snapshot 为空 → 先跑一次 store.refresh() 拿基线快照，
+            #    避免还原后把所有已有 mod 都算成 "新增"
+            if self._last_snapshot is None:
+                self.manager.refresh()   # 跑 store 初始化
+                before = dict(self._snapshot())
+                first_baseline = True
+            else:
+                before = dict(self._last_snapshot)
+                first_baseline = False
+
             res = self._bkmgr().restore(str(backup_id), Path(dest))
-            return {**res, **self.list_backups()}
+            if not res.get("ok"):
+                return {**res, **self.list_backups()}
+
+            # 2) 还原成功 → store 刷新 + 算报告 + 同步快照
+            self.manager.refresh()
+            after = self._snapshot()
+            scan_report = self._scan_report(before, after)
+            if first_baseline:
+                scan_report["first_baseline"] = True  # 标注：首次基线，未对比历史变化
+            self._last_snapshot = after
+            _log.info("[api] restore_backup 完成: scan_report=%s", scan_report)
+            # 把 get_state() 的字段展开到顶层，前端 applyState(s) 直接读 s.enabled/disabled
+            state = self.get_state()
+            return {**res, "scan_report": scan_report, **self.list_backups(), **state}
 
         return self._dispatch_async(_do, f"restore_backup({backup_id},{target})")
 
@@ -2902,6 +3082,7 @@ class Api:
             "detected_workshop": str(game.workshop_dir) if game and game.workshop_dir else None,
             "detected_mods": str(game.mods_dir) if game else None,
             "language": self.manager.get_language(),
+            "workshop_html_fill": self.manager.get_workshop_html_fill(),
             "backup": self.manager.get_backup_settings(),
             "tag_i18n": self.manager.tag_i18n(),
             "tag_i18n_en2zh": self.manager.tag_i18n_en2zh(),
@@ -2932,6 +3113,7 @@ class Api:
         manual_mods_dir: Optional[str] = None,
         manual_save_dir: Optional[str] = None,
         language: Optional[str] = None,
+        workshop_html_fill: Optional[bool] = None,
     ) -> dict:
         def _do():
             # 先记录旧值，判断路径有没有变
@@ -2955,6 +3137,8 @@ class Api:
             )
             if language:
                 self.manager.set_language(str(language))
+            if workshop_html_fill is not None:
+                self.manager.set_workshop_html_fill(bool(workshop_html_fill))
 
             # 只有**路径变化**才全量重扫——改语言/只改空路径都是纯内存操作，
             # 扫一遍游戏目录 + 所有 mod + DLL/PCK 完全没必要（RimCrow 也不做）。

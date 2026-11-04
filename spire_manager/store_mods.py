@@ -159,6 +159,10 @@ class ModManager:
         # 粗粒度操作锁：串行化 refresh / delete / set_enabled 等改写内存状态的操作
         # （见 _serialized 装饰器），避免多线程派发时并发改 self._mods / self._state
         self._op_lock = threading.RLock()
+        # refresh 单飞：主程序后台扫描与前端触发的 refresh 共用同一次扫描结果
+        self._refresh_gate_lock = threading.Lock()
+        self._refresh_in_progress = False
+        self._refresh_ticket: Optional[dict] = None
         # ── O2: 启用/停用侧缓存（避免每次 ordered_enabled() 重建 list + O(N) 遍历） ──
         # 预计算 enabled 侧的 list/set/id-index，所有依赖检查、状态读取直接查缓存；
         # 任何会改 enabled_order/disabled_order/_mods 的操作（refresh/set_enabled/delete/
@@ -267,6 +271,7 @@ class ModManager:
             character_mods=list(self._state.character_mods),
             language=self._state.language,
             auto_check_steam=self._state.auto_check_steam,
+            workshop_html_fill=self._state.workshop_html_fill,
             groups={k: list(v) for k, v in self._state.groups.items()},
             group_order=list(self._state.group_order),
             mod_meta={k: dict(v) for k, v in self._state.mod_meta.items()},
@@ -362,6 +367,9 @@ class ModManager:
             # 读 auto_check_steam（兼容老配置没有这个字段）
             if isinstance(raw.get("auto_check_steam"), bool):
                 state.auto_check_steam = bool(raw["auto_check_steam"])
+            # 读工坊页面自动补全开关（兼容老配置缺省为开启）
+            if isinstance(raw.get("workshop_html_fill"), bool):
+                state.workshop_html_fill = bool(raw["workshop_html_fill"])
             # ── P0 新增字段读取（全部兼容老配置缺省）──
             # 自定义分组
             raw_groups = raw.get("groups")
@@ -420,6 +428,12 @@ class ModManager:
         # 构造器显式传了优先最高
         if self._override_prefer_bmm is not None:
             self._state.prefer_better_mod_menu = bool(self._override_prefer_bmm)
+        # 同步手动开关到 workshop 模块（关闭后不再发 HTML 请求）
+        try:
+            from .workshop import set_html_fill_enabled
+            set_html_fill_enabled(self._state.workshop_html_fill)
+        except Exception:
+            pass
 
     def save_state(self) -> None:
         """原子写入 profile JSON，带唯一 tmp 文件名 + Windows 文件锁重试。
@@ -1449,6 +1463,17 @@ class ModManager:
         self._state.auto_check_steam = bool(enabled)
         self._mark_dirty()
 
+    def get_workshop_html_fill(self) -> bool:
+        """工坊页面自动补全开关（依赖 + 中文描述）。"""
+        return bool(self._state.workshop_html_fill)
+
+    def set_workshop_html_fill(self, enabled: bool) -> None:
+        """切换工坊页面自动补全；关闭后立即停止后续 HTML 请求。"""
+        self._state.workshop_html_fill = bool(enabled)
+        from .workshop import set_html_fill_enabled
+        set_html_fill_enabled(self._state.workshop_html_fill)
+        self._mark_dirty()
+
 
     # ============================================================ mod 备份 --
 
@@ -1645,79 +1670,124 @@ class ModManager:
         return set(self._mod_warnings_map.get(str(mod_id).lower(), []))
 
     def _merge_workshop_deps(self, scan) -> None:
-        """爬 Steam 工坊页面拿依赖，合并到 scan.mods 里的 ModInfo.manifest.dependencies。
+        """爬 Steam 工坊页面拿依赖，只处理「启用列表 + 已安装依赖闭包」。
 
-        RimCrow 式策略：
-          1) 有 7 天缓存的直接跳过（永不重复爬）
-          2) 需要爬的用 ThreadPoolExecutor 4 线程并发（限速锁全局，不会撞风控）
-          3) manifest 已自带 dependencies 的跳过
+        P1 限流策略：
+          1) 初始目标 = state.enabled_order 中的 mod + scan 里物理启用的工坊 mod
+             （首次启动 enabled_order 可能尚未同步，物理 source 兜底避免漏爬）
+          2) 先离线读取 manifest.dependencies 和 deps.json 扩展闭包（零网络）
+          3) 再对仍缺依赖的 mod 顺序爬取，新发现的已安装依赖继续入队（BFS）
+          4) manifest 已自带 dependencies 的跳过
+          5) 全局 HTML 门 + 2s 间隔由 workshop 模块负责，这里只控制爬取范围
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from .workshop import fetch_workshop_dependencies
+        from .workshop import fetch_workshop_dependencies, read_deps_meta
         from .scanner import set_scan_stage, tick_scan_progress
 
-        # 1) 建 workshop_id → ModInfo 映射
+        # 1) workshop_id → ModInfo / mod_id → ModInfo
         ws_to_mod: dict[str, ModInfo] = {}
+        mod_by_low: dict[str, ModInfo] = {}
         for info in scan.mods.values():
+            mod_by_low[info.mod_id.lower()] = info
             if info.workshop_id:
                 ws_to_mod[str(info.workshop_id)] = info
 
         if not ws_to_mod:
             return
 
-        # 2) 分桶：已有依赖 → 跳过；没依赖 → 爬（2026-11-03 重构：旧 _is_rate_limited 已砍）
-        rate_limited_skipped = 0
-        to_fetch: list[tuple[str, ModInfo]] = []
-        for wid, info in ws_to_mod.items():
-            if info.manifest.dependencies:
-                continue  # manifest 自带，不用爬
-            to_fetch.append((wid, info))
+        # 2) 初始目标：启用列表 + 物理启用的本地副本
+        #    工坊 mod 的 source 恒为 "workshop"，不代表启用状态，不能拿来兜底；
+        #    只有本地副本 source == "local" 才代表物理启用。
+        enabled_lower = {str(m).lower() for m in self._state.enabled_order}
+        targets: set[str] = {
+            wid for wid, info in ws_to_mod.items()
+            if info.mod_id.lower() in enabled_lower or info.source == "local"
+        }
 
-        total = len(ws_to_mod)
-        skip = total - len(to_fetch)
-        _log.info("[ws-deps] %d 个 workshop mod: %d manifest自带跳过，%d 封禁跳过，%d 需要爬", total, skip - rate_limited_skipped, rate_limited_skipped, len(to_fetch))
+        if not targets:
+            _log.info("[ws-deps] 启用列表为空，跳过依赖爬取")
+            return
 
-        merged_count = 0
+        frontier: list[str] = sorted(targets)
+        visited: set[str] = set(frontier)
+
+        def _add_dep(raw) -> None:
+            """把已安装的依赖 wid 加进闭包（未安装的依赖没有本地页面可爬）。"""
+            dep_s = str(raw or "")
+            if not dep_s:
+                return
+            dep_info = mod_by_low.get(dep_s.lower())
+            dep_wid = str(dep_info.workshop_id) if dep_info and dep_info.workshop_id else dep_s
+            if dep_wid in ws_to_mod and dep_wid not in visited:
+                visited.add(dep_wid)
+                targets.add(dep_wid)
+                frontier.append(dep_wid)
+
+        # 3) 离线闭包：manifest 自带 + deps.json 缓存，零网络
+        while frontier:
+            wid = frontier.pop(0)
+            info = ws_to_mod[wid]
+            for dep in info.manifest.dependencies or []:
+                _add_dep(dep)
+            for dep in read_deps_meta(wid).get("dependencies") or []:
+                _add_dep(dep.get("workshop_id") if isinstance(dep, dict) else dep)
+
+        total_ws = len(ws_to_mod)
+        to_fetch: list[str] = [
+            wid for wid in sorted(targets)
+            if not ws_to_mod[wid].manifest.dependencies
+        ]
+        _log.info("[ws-deps] 启用目标 %d/%d 个工坊 mod（含已安装依赖闭包），%d 个需要爬",
+                  len(targets), total_ws, len(to_fetch))
 
         if not to_fetch:
-            _log.info("[ws-deps] 完成: %d/%d 补充（全自带）", merged_count, total)
             return
 
         set_scan_stage("fetch_deps")
 
-        # 3) 并发爬 4 线程（workshop 模块的限速锁是全局的，线程间自动排队 1.2s 间隔）
-        def _fetch_item(task: tuple[str, ModInfo]) -> tuple[str, Optional[list[dict]]]:
-            wid, _ = task
-            tick_scan_progress(current=f"爬依赖: {wid}")
-            try:
-                return wid, fetch_workshop_dependencies(wid, timeout=15)
-            except Exception as e:
-                _log.warning("[ws-deps] 爬 %s 失败: %s", wid, e)
-                return wid, None
-
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ws-deps") as ex:
-            futures = {ex.submit(_fetch_item, t): t for t in to_fetch}
-            for fut in as_completed(futures):
-                wid, ws_deps = fut.result()
+        # 4) 顺序爬取；每爬完一批，把新发现的已安装依赖加入下一批
+        merged_count = 0
+        fetched = 0
+        while to_fetch:
+            batch = to_fetch
+            to_fetch = []
+            for wid in batch:
+                tick_scan_progress(current=f"爬依赖: {wid}")
+                try:
+                    ws_deps = fetch_workshop_dependencies(wid, timeout=15)
+                except Exception as e:
+                    _log.warning("[ws-deps] 爬 %s 失败: %s", wid, e)
+                    ws_deps = None
+                fetched += 1
                 if not ws_deps:
                     continue
+
                 info = ws_to_mod[wid]
-                # 4) workshop 依赖 ID → 本地 mod_id 映射
                 added: list[str] = []
                 for dep in ws_deps:
                     dep_wid = str(dep.get("workshop_id", ""))
+                    _add_dep(dep_wid)
                     if dep_wid and dep_wid in ws_to_mod:
                         dep_mod_id = ws_to_mod[dep_wid].mod_id
-                        if dep_mod_id not in added:
-                            added.append(dep_mod_id)
                     else:
-                        if dep_wid not in added:
-                            added.append(dep_wid)
+                        dep_mod_id = dep_wid
+                    if dep_mod_id and dep_mod_id not in added:
+                        added.append(dep_mod_id)
                 if added:
                     info.manifest.dependencies = added
                     merged_count += 1
 
-        _log.info("[ws-deps] 完成: %d/%d 个 workshop mod 补充了依赖", merged_count, total)
+            # 新依赖中还没依赖数据的，排进下一批；manifest 自带的继续扩展闭包
+            while frontier:
+                nw = frontier.pop(0)
+                new_info = ws_to_mod[nw]
+                if new_info.manifest.dependencies:
+                    for dep in new_info.manifest.dependencies:
+                        _add_dep(dep)
+                else:
+                    to_fetch.append(nw)
+
+        _log.info("[ws-deps] 完成: 爬取 %d 个，%d/%d 个目标补充了依赖",
+                  fetched, merged_count, len(targets))
 
     def has_dependency_warning(self, mod_id: str) -> bool:
         """快速判断某 mod 是否有任何依赖警告（用于 UI 标红）。"""
@@ -1955,8 +2025,63 @@ class ModManager:
 
     # ------------------------------------------------------------- 核心流程 --
 
-    @_serialized
     def refresh(self, manual_game_root: Optional[Path] = None) -> ModScanResult:
+        """单飞 refresh：同一路径的并发调用共享同一次扫描结果。
+
+        主程序启动后台扫描和前端 refresh 可能同时触发；如果两个都真正执行，
+        会各自启动依赖爬取线程，导致 HTML 请求叠加触发 Steam 429。
+        """
+        key = (
+            str(Path(manual_game_root).resolve())
+            if manual_game_root
+            else "__auto__"
+        )
+
+        while True:
+            with self._refresh_gate_lock:
+                if not self._refresh_in_progress:
+                    self._refresh_in_progress = True
+                    ticket = {
+                        "key": key,
+                        "event": threading.Event(),
+                        "result": None,
+                        "error": None,
+                    }
+                    self._refresh_ticket = ticket
+                    break
+
+                ticket = self._refresh_ticket
+                same_key = bool(ticket and ticket["key"] == key)
+
+            # 等待当前扫描结束（不持有锁，避免阻塞其它路径的 refresh 判断）
+            if ticket is not None:
+                ticket["event"].wait()
+
+            if same_key:
+                if ticket["error"] is not None:
+                    raise ticket["error"]
+                return ticket["result"]
+
+            # 扫描路径不同：等前一次结束后重新竞争，保证本次路径真的被扫到
+
+        try:
+            result = self._refresh_impl(manual_game_root)
+        except BaseException as e:
+            ticket["error"] = e
+            raise
+        else:
+            ticket["result"] = result
+        finally:
+            with self._refresh_gate_lock:
+                self._refresh_in_progress = False
+                if self._refresh_ticket is ticket:
+                    self._refresh_ticket = None
+                ticket["event"].set()
+
+        return result
+
+    @_serialized
+    def _refresh_impl(self, manual_game_root: Optional[Path] = None) -> ModScanResult:
         """重新检测游戏 + 扫描所有 mod，然后用扫描结果修正 state 中的 order。"""
         from .scanner import detect_game_install
 
@@ -2022,16 +2147,8 @@ class ModManager:
         self._errors.extend(scan.errors)
         self._subscribed_known = bool(getattr(scan, "subscribed_known", True))
 
-        # 爬 Steam 工坊依赖 → 纯后台线程（撞 429 也不阻塞 refresh）
-        def _bg_merge_deps() -> None:
-            try:
-                _log.info("[ws-deps] 后台依赖爬取开始（不阻塞 UI）")
-                self._merge_workshop_deps(scan)
-                _log.info("[ws-deps] 后台依赖爬取完成")
-            except Exception as e:
-                _log.exception("[ws-deps] 后台依赖爬取失败: %s", e)
-
-        threading.Thread(target=_bg_merge_deps, daemon=True, name="ws-deps-bg").start()
+        # 爬 Steam 工坊依赖延后到启用/停用分类确定之后启动，
+        # 否则 enabled_order 尚未同步，初始目标会退化为全库工坊 mod。
 
         # ================================================================
         # STS2 原生清单（settings.save → mod_settings.mod_list）：
@@ -2101,11 +2218,8 @@ class ModManager:
                 versions = self._mod_versions.get(mid_lower, [])
                 valid_keys: set[str] = set()
                 for v in versions:
-                    if v.workshop_id:
-                        # 新格式：每个 workshop 副本独立 key
-                        valid_keys.add(f"ws_{v.workshop_id}")
-                    else:
-                        valid_keys.add(v.source)  # "local" 或 "disabled"
+                    # 2026-11-04: 统一用 mod_version_key（物理副本唯一标识 = str(install_dir)）
+                    valid_keys.add(mod_version_key(v))
                 # 如果没有物理副本（ghost），跳过
                 if not valid_keys:
                     continue
@@ -2127,7 +2241,7 @@ class ModManager:
                 )
                 mods_dir_old_value = old_ss.get("mods_directory")
                 for v in versions:
-                    key = f"ws_{v.workshop_id}" if v.workshop_id else v.source
+                    key = mod_version_key(v)
                     if v.source == "local":
                         new_ss[key] = True if mods_dir_old_value is None else bool(mods_dir_old_value)
                     elif v.source == "disabled":
@@ -2340,9 +2454,9 @@ class ModManager:
                 if info.workshop_id or info.source == "workshop":
                     # 1) 优先查 profile.json 的 _source_states（用户权威——明确写了每个物理副本的启停）
                     ss = self._source_states.get(info.mod_id.lower(), {})
-                    ws_key = f"ws_{info.workshop_id}"
-                    if ws_key in ss:
-                        return ss[ws_key] is False
+                    state_key = mod_version_key(info)
+                    if state_key in ss:
+                        return ss[state_key] is False
                     # 2) 再看 settings.save 的 nat_disabled_lower（兼容老数据：用户从没通过管理器停过这个 workshop mod）
                     return info.mod_id.lower() in nat_disabled_lower
                 return info.source == "disabled"
@@ -2440,6 +2554,18 @@ class ModManager:
             self._bmm_settings = []
             self._bmm_profiles = {}
             _log.info("refresh: 已启用纯游戏源逻辑（prefer_better_mod_menu=False），忽略 BetterModMenu，用目录驱动决定启用/停用")
+
+        # 爬 Steam 工坊依赖 → 纯后台线程（撞 429 也不阻塞 refresh）
+        # 必须放在启用/停用分类确定之后，初始目标才拿得到权威 enabled_order。
+        def _bg_merge_deps() -> None:
+            try:
+                _log.info("[ws-deps] 后台依赖爬取开始（不阻塞 UI）")
+                self._merge_workshop_deps(scan)
+                _log.info("[ws-deps] 后台依赖爬取完成")
+            except Exception as e:
+                _log.exception("[ws-deps] 后台依赖爬取失败: %s", e)
+
+        threading.Thread(target=_bg_merge_deps, daemon=True, name="ws-deps-bg").start()
 
         _log.info(
             "refresh 完成: 共 %d 个mod, 启用侧 %d, 停用侧 %d, errors=%d",
@@ -2813,9 +2939,9 @@ class ModManager:
                 if is_ws_mod:
                     # 2a) profile.json 的 _source_states 优先（用户在管理器里明确停过这个物理副本）
                     ss = self._source_states.get(low, {})
-                    ws_key = f"ws_{info.workshop_id}"
-                    if ws_key in ss:
-                        classification[low] = "disabled" if ss[ws_key] is False else "enabled"
+                    state_key = mod_version_key(info)
+                    if state_key in ss:
+                        classification[low] = "disabled" if ss[state_key] is False else "enabled"
                         continue
                     # 2b) 再看 settings.save 里的 is_enabled（兼容老数据）
                     classification[low] = nat_class.get(low, "enabled")
@@ -3126,13 +3252,9 @@ class ModManager:
             self._mod_versions[low] = remaining
             info.install_dir = remaining[0].install_dir
             info.source = remaining[0].source
-            # 从 source_states 里删除对应 source
-            v_enum = norm_mod_source(
-                next((v.source for v in self._mod_versions.get(low, [])
-                      if Path(str(v.install_dir)) == target_dir), '')
-            )
+            # 从 source_states 里删除被删副本对应的 key（2026-11-04: key 已改成 version_key）
             srcs = self._source_states.get(low, {})
-            srcs.pop(v_enum, None)
+            srcs.pop(mod_version_key(info), None)
 
         self._invalidate_mod_caches()
         self.save_state()
@@ -3340,28 +3462,96 @@ class ModManager:
     ) -> bool:
         """启用/停用 mod。
 
-        2026-10 核心改动：整条链路改用 version_key 精确定位物理副本。
-        version_key = mod_version_key(info) = str(info.install_dir)，每个物理副本唯一。
-        因为 norm_mod_source("local") 和 norm_mod_source("disabled") 都是 "mods_directory"，
-        source 参数无法区分同一个 mod_id 下 Mods/ vs .mods_disabled/ 的两份本地副本。
+        两种模式：
+        - 精确模式（version_key 有值）：严格命中 1 个物理副本，多副本独立启停
+        - 批量模式（version_key 无值）：遍历同 mod_id 所有物理副本，逐个执行
+          （用于 apply_pack、变体切换、clear_enabled 等后端批量管理场景）
 
-        - version_key 有值 → _find_by_key 精确找物理副本（新路径，多副本独立启停）
-        - version_key 无值 → 回退 _find(mod_id, source)（向后兼容）
+        调用方契约：
+        - 前端所有入口必须传 version_key
+        - 后端内部批量管理可以不传 version_key
 
         工坊副本：不动文件，改 settings.save 里 (id, "steam_workshop") 的 is_enabled
         本地副本：搬目录 Mods/ <-> .mods_disabled/（物理位置即启停状态）
-
-        auto_save=False 时只改内存状态，不写 settings.save/BMM settings，
-        由调用方（api.save_all）统一持久化。
         """
+        # ====== 调度层 ======
         if version_key:
-            info = self._find_by_key(version_key)
+            # 精确模式
+            ok, new_vk = self._set_enabled_inner(mod_id, enable, source, version_key, auto_save=False)
+            # 启用互斥：启用 local/disabled 副本时，自动停用同 mod_id 其他 local/disabled 副本
+            # 2026-11-05: 传 new_vk（物理层之后的新路径），确保互斥跳过的就是刚操作的那个确切副本
+            if ok and enable:
+                self._apply_mutual_exclusion(mod_id, new_vk or version_key, auto_save=False)
+            if auto_save:
+                self.save_state()
+            return ok
         else:
-            info = self._find(mod_id, source)
+            # 批量模式
+            versions = list(self._mod_versions.get(mod_id.lower(), []))
+            if not versions:
+                _log.warning("[set_enabled 批量] mod_id=%s 无物理副本 → 跳过", mod_id)
+                return False
+            any_ok = False
+            for v in versions:
+                # 批量模式跳过 workshop 副本——
+                # 精确模式（用户手动点单个副本，传了 version_key）可以启停 workshop（改 save 文件不动 manifest）；
+                # 批量模式（后端内部 apply_pack / clear_enabled / 变体切换，不传 version_key）跳过 workshop，
+                # 防止批量操作偷偷改 Steam 管理的副本（前端不拦 workshop，用户想管自己点精确模式）。
+                if v.workshop_id:
+                    _log.debug("[set_enabled 批量] 跳过 workshop 副本: %s", v.mod_id)
+                    continue
+                vk = mod_version_key(v)
+                ok, _ = self._set_enabled_inner(mod_id, enable, source, vk, auto_save=False)
+                any_ok = any_ok or ok
+            if auto_save:
+                self.save_state()
+            return any_ok
+
+    def _apply_mutual_exclusion(self, mod_id: str, active_version_key: str, auto_save: bool = True) -> None:
+        """启用互斥：同 mod_id 启用一个 local/disabled 副本时，自动停用其他 local/disabled 副本。
+
+        workshop 副本不参与互斥（由 Steam 管理）。
+        调用时机：精确模式 set_enabled 启用成功后。
+
+        ✅ active_version_key 现在是**物理层之后**的新路径（由调度层传入 new_vk），
+        物理层搬目录后已更新 → 直接用它跳过，不会漏也不会错。
+        """
+        mid_lower = mod_id.lower()
+        versions = list(self._mod_versions.get(mid_lower, []))
+        excluded = 0
+        for v in versions:
+            vk = mod_version_key(v)
+            if active_version_key and vk == active_version_key:
+                continue  # 跳过刚操作的那个（确切副本）
+            if v.workshop_id:
+                continue  # workshop 副本不参与互斥
+            # 其他 local/disabled 副本 → 强制停用
+            _log.info("[互斥] 自动停用同 mod_id 其他副本: %s (vk=%s)", v.mod_id, vk)
+            _, _ = self._set_enabled_inner(mod_id, False, version_key=vk, auto_save=False)
+            excluded += 1
+        if excluded:
+            _log.info("[互斥] %s 停用 %d 个同 mod_id 其他副本", mod_id, excluded)
+            if auto_save:
+                self.save_state()
+
+    def _set_enabled_inner(
+        self, mod_id: str, enable: bool,
+        source: Optional[str] = None, version_key: Optional[str] = None,
+        auto_save: bool = True,
+    ) -> tuple:
+        """单副本启用/停用（内部方法，由 set_enabled 调度层调用）。
+
+        返回 (ok: bool, new_version_key: str|None)
+        new_version_key = 物理层之后 mod_version_key(info)，物理层搬目录后会变。
+        必须传入 version_key（精确到物理副本粒度）。
+        """
+        if not version_key:
+            _log.error("[set_enabled_inner] 必须传 version_key！mod_id=%s", mod_id)
+            return False, None
+        info = self._find_by_key(version_key)
         if info is None or self._game is None:
-            _log.warning("[set_enabled] mod_id=%s version_key=%s 找不到或 GameInstall 为空, enable=%s → 忽略",
-                         mod_id, version_key, enable)
-            return False
+            _log.warning("[set_enabled_inner] version_key=%s 找不到或 GameInstall 为空 → 忽略", version_key)
+            return False, None
 
         # P1: Pinned Mod 保护 —— 如果 enabled 被锁定，拒绝停用/启用操作
         pinned = self._state.pinned.get(info.mod_id.lower())
@@ -3369,19 +3559,10 @@ class ModManager:
             target = bool(pinned["enabled"])
             if enable != target:
                 _log.warning("[set_enabled] %s 被 pinned 锁定（enabled=%s），拒绝切换到 enable=%s", info.mod_id, target, enable)
-                return False
+                return False, None
 
         is_workshop_related = bool(info.workshop_id)
 
-        # 2026-10-15：state_key 必须在物理层之前算好！
-        # 物理层搬目录会改 info.source（"local" ↔ "disabled"），但我们需要的是
-        # "这个物理副本原本是什么 source"——搬目录之前的原始值
-        if info.workshop_id:
-            # 2026-11-01 多副本修复：同 mod_id 可能有多个 workshop 副本（如圣主历险记原版 vs 修复版）
-            # 必须用 ws_{workshop_id} 做唯一 key，不能都堆在 "steam_workshop" 下互相覆盖
-            _orig_state_key = f"ws_{info.workshop_id}"
-        else:
-            _orig_state_key = info.source  # "local" 或 "disabled"
         _orig_install_dir = str(info.install_dir)  # 物理层可能搬目录，保存原始路径用于匹配 _mod_versions
 
         _log.info(
@@ -3439,6 +3620,13 @@ class ModManager:
                       info.mod_id, info.source, enable)
             phys_ok = True
 
+        # 2026-11-04：物理层之后算 state_key = version_key
+        # 物理层搬目录会改 info.install_dir（Mods/ ↔ .mods_disabled/），
+        # 必须在物理层之后才能拿到当前真实路径 → 作为 source_states 的唯一 key。
+        # workshop 副本 install_dir 是 Steam 路径，天然唯一；local/disabled 搬目录后路径已更新，
+        # 存的永远是当前物理位置 → 下次扫描能精确对上。
+        _state_key = mod_version_key(info)
+
         # ====== 关键修复：把物理层返回的新 info 同步回内存模型 self._mods ======
         # 否则 get_state → _mod_dict 序列化出来的还是旧 source/install_dir → 前端看到的图标/路径都不对
         mid_lower = info.mod_id.lower()
@@ -3464,11 +3652,11 @@ class ModManager:
         # 逻辑层：settings.save is_enabled + _source_states + 排序
         # =====================================================================
         if self.uses_native_mod_list:
-            # 只改当前 source key（游戏原生逻辑：settings.save 里 is_enabled 是 canonical 粒度）
-            self._source_states.setdefault(mid_lower, {})[_orig_state_key] = enable
+            # 2026-11-04: key 改成 version_key（物理层之后算的，当前物理路径）
+            self._source_states.setdefault(mid_lower, {})[_state_key] = enable
 
             # 记录最近 toggle 时间（前端停用侧排序用）
-            self._source_last_toggled.setdefault(mid_lower, {})[_orig_state_key] = time.time()
+            self._source_last_toggled.setdefault(mid_lower, {})[_state_key] = time.time()
 
             # 从 source_states 聚合：该 canonical 整体 is_enabled（任何 source 启用即为 True）
             mod_ss = self._source_states.get(mid_lower, {})
@@ -3524,13 +3712,15 @@ class ModManager:
                 self._state.disabled_order.insert(0, canonical)
             _log.info(
                 "[set_enabled] 原生清单模式：state_key=%s enable=%s；source_states[%s]=%s；enabled_order(%d) disabled_order(%d)",
-                _orig_state_key, enable, mid_lower, mod_ss,
+                _state_key, enable, mid_lower, mod_ss,
                 len(self._state.enabled_order), len(self._state.disabled_order),
             )
             if auto_save: self.save_state()
             else: self._mark_dirty()
-            self._invalidate_mod_caches()  # ← 漏了！改了 enabled_order 必须清缓存
-            return True
+            self._invalidate_mod_caches()
+            # 2026-11-05: 返回 (ok, new_version_key) 给调度层，互斥需要跳过这个确切副本
+            # new_version_key = mod_version_key(info) 在物理层之后算的，不会因为搬目录变
+            return True, _state_key
 
         # =====================================================================
         # 模式 A：BetterModMenu（原生清单不可用 + prefer_better_mod_menu=True + 已安装 BMM）
@@ -3591,7 +3781,7 @@ class ModManager:
                       enable, len(self._state.enabled_order), len(self._state.disabled_order))
             if auto_save: self.save_state()
             else: self._mark_dirty()
-            return True
+            return True, _state_key
 
         # =====================================================================
         # 模式 B：fallback（物理目录驱动 = LOM 没启用）
@@ -3611,14 +3801,7 @@ class ModManager:
         self._invalidate_mod_caches()
         if auto_save: self.save_state()
         else: self._mark_dirty()
-        return True
-
-    def toggle_enabled(self, mod_id: str) -> None:
-        info = self._find(mod_id)
-        if info is None:
-            return
-        currently_enabled = any(m.lower() == info.mod_id.lower() for m in self._state.enabled_order)
-        self.set_enabled(mod_id, not currently_enabled)
+        return True, _state_key
 
     # --------------------------------------------------------------- 启动游戏
 

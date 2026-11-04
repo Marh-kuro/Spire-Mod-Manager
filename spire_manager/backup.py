@@ -57,9 +57,11 @@ def _now() -> tuple[int, str]:
 class BackupManager:
     """管理某个 data 目录下的 mod 备份。线程安全（单进程内）。"""
 
-    def __init__(self, data_dir: Path):
-        self.data_dir = Path(data_dir)
-        self.root = self.data_dir / "backups"
+    def __init__(self, backup_root: Path, data_root: Optional[Path] = None):
+        """backup_root=备份存放目录（= data/backups 或用户自定义路径）。
+        data_root=SMM data 根目录（= data/），用来找 cache/。不传则回退 backup_root.parent。"""
+        self.root = Path(backup_root)
+        self.data_root = Path(data_root) if data_root else self.root.parent
         self.index_path = self.root / "index.json"
         self._cache: Optional[list[dict]] = None
         self._cache_mtime: float = -1.0
@@ -184,6 +186,30 @@ class BackupManager:
         return cur != latest.get("fingerprint")
 
     # ------------------------------------------------------------------ 创建
+    def _collect_cache_files(self, info) -> list[tuple[Path, str]]:
+        """收集与该 mod 关联的缓存文件，返回 [(绝对路径, zip内相对路径), ...]。
+
+        缓存都放在 zip 的 `__cache__/` 子目录下，与 mod 本体隔离，方便还原时选择性恢复。
+        """
+        cache_root = self.data_root / "cache"
+        result: list[tuple[Path, str]] = []
+        wid = getattr(info, "workshop_id", None)
+        if wid:
+            wid = str(wid)
+            # 1. workshop/{wid}/ 整个目录（meta.zh.json, deps.json, preview.*）
+            ws_cache = cache_root / "workshop" / wid
+            if ws_cache.is_dir():
+                for p in ws_cache.rglob("*"):
+                    if p.is_file():
+                        result.append((p, f"__cache__/workshop/{wid}/{p.name}"))
+            # 2. steam_workshop/{wid}.json
+            steam_cache = cache_root / "steam_workshop" / f"{wid}.json"
+            if steam_cache.is_file():
+                result.append((steam_cache, f"__cache__/steam_workshop/{wid}.json"))
+        # 3. dll / pck 扫描缓存（按 mod 目录内的 DLL/PCK 文件哈希匹配）
+        #    跳过：扫描缓存体积小但 key 不稳定（依赖文件哈希），还原时收益低
+        return result
+
     def create(self, info, kind: str = "manual", note: str = "") -> dict:
         """为 mod 创建一份压缩备份，返回记录 dict。"""
         if info is None or info.install_dir is None:
@@ -195,6 +221,9 @@ class BackupManager:
         files = [p for p in src.rglob("*") if p.is_file()]
         if not files:
             raise ValueError("目录为空，无可备份内容")
+
+        # 收集关联缓存（workshop mod 才有）
+        cache_files = self._collect_cache_files(info)
 
         mod_id = str(info.mod_id)
         version = str(info.manifest.version or "")
@@ -212,12 +241,20 @@ class BackupManager:
                 original_bytes += p.stat().st_size
             except OSError:
                 pass
+        cache_bytes = 0
+        for p, _ in cache_files:
+            try:
+                cache_bytes += p.stat().st_size
+            except OSError:
+                pass
 
-        _log.info("[backup] 开始备份 %s (%d 个文件, %.1f MB) -> %s",
-                  mod_id, len(files), original_bytes / 1e6, archive.name)
+        _log.info("[backup] 开始备份 %s (%d 个文件, %.1f MB, 缓存 %d 个/%.1f MB) -> %s",
+                  mod_id, len(files), original_bytes / 1e6,
+                  len(cache_files), cache_bytes / 1e6, archive.name)
         try:
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_LZMA,
                                  compresslevel=_LZMA_PRESET, allowZip64=True) as zf:
+                # mod 本体
                 for p in files:
                     rel = str(p.relative_to(src)).replace("\\", "/")
                     try:
@@ -229,6 +266,17 @@ class BackupManager:
                         zf.write(p, rel, compress_type=zipfile.ZIP_STORED)
                     else:
                         zf.write(p, rel, compress_type=zipfile.ZIP_LZMA)
+                # 关联缓存（放在 __cache__/ 子目录）
+                for p, arcname in cache_files:
+                    try:
+                        size = p.stat().st_size
+                    except OSError:
+                        size = 0
+                    use_stored = size > _BIG_FILE_BYTES and p.suffix.lower() in _ALREADY_COMPRESSED_EXTS
+                    if use_stored:
+                        zf.write(p, arcname, compress_type=zipfile.ZIP_STORED)
+                    else:
+                        zf.write(p, arcname, compress_type=zipfile.ZIP_LZMA)
         except Exception as e:
             _log.error("[backup] 备份失败 %s: %s", mod_id, e)
             try:
@@ -255,6 +303,9 @@ class BackupManager:
             "original_bytes": original_bytes,
             "archive_bytes": archive_bytes,
             "file_count": len(files),
+            "cache_file_count": len(cache_files),
+            "cache_bytes": cache_bytes,
+            "has_cache": len(cache_files) > 0,
             "fingerprint": self.fingerprint(src, version),
             "origin_dir": str(src),
             "archive": rel_archive,
@@ -342,8 +393,45 @@ class BackupManager:
             return {"ok": False, "error": str(e)}
 
     # ------------------------------------------------------------------ 还原
-    def restore(self, backup_id: str, target_dir: Path) -> dict:
-        """把备份解包到 target_dir。还原前把已存在的 target 改名留档，失败可回滚。"""
+    def _restore_cache(self, tmp: Path, force: bool = False) -> tuple[int, int]:
+        """把 tmp/__cache__/ 里的文件恢复到 data/cache/。返回 (文件数, 总字节数)。
+
+        默认只补缺失文件（force=False）。force=True 时覆盖已有。
+        """
+        cache_dir = tmp / "__cache__"
+        if not cache_dir.is_dir():
+            return 0, 0
+        real_cache = self.data_root / "cache"
+        count = 0
+        total = 0
+        skipped = 0
+        for p in cache_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(cache_dir)
+            dest = real_cache / rel
+            if dest.exists() and not force:
+                skipped += 1
+                continue   # 默认只补缺失，不覆盖已有（定论 #6）
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(p), str(dest))
+                count += 1
+                total += p.stat().st_size
+            except OSError as e:
+                _log.warning("[backup] 恢复缓存失败 %s: %s", rel, e)
+        if count or skipped:
+            _log.info("[backup] 缓存恢复: 写入 %d 个 (%.1f MB), 跳过已有 %d 个 (force=%s)",
+                      count, total / 1e6, skipped, force)
+        return count, total
+
+    def restore(self, backup_id: str, target_dir: Path,
+                restore_cache: bool = True, force_cache: bool = False) -> dict:
+        """把备份解包到 target_dir。还原前把已存在的 target 改名留档，失败可回滚。
+
+        restore_cache=True 时，如果 zip 里带了 __cache__/，会把缓存写回 data/cache/。
+        force_cache=True 时覆盖已有缓存文件；默认只补缺失（定论 #6）。
+        """
         r = self.get(backup_id)
         if r is None:
             return {"ok": False, "error": "备份不存在"}
@@ -357,16 +445,25 @@ class BackupManager:
 
         tmp = target.parent / f"{target.name}.restore-{ts}"
         moved_old: Optional[Path] = None
+        restored_cache_files = 0
+        restored_cache_bytes = 0
         try:
             tmp.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(archive) as zf:
                 tmp_root = tmp.resolve()
+                cache_members: list[str] = []
                 for member in zf.namelist():
                     # 防 zip slip：解包目标解析后必须仍在临时目录内
                     dest = (tmp / member).resolve()
                     if not dest.is_relative_to(tmp_root):
                         raise ValueError(f"非法归档路径: {member}")
+                    if member.startswith("__cache__/"):
+                        cache_members.append(member)
                 zf.extractall(tmp)
+
+            # 还原缓存（可选）
+            if restore_cache and cache_members:
+                restored_cache_files, restored_cache_bytes = self._restore_cache(tmp, force=force_cache)
 
             if target.exists():
                 moved_old = target.parent / f"{target.name}.bak-{ts}"
@@ -391,11 +488,14 @@ class BackupManager:
                 pass
             return {"ok": False, "error": str(e)}
 
-        _log.info("[backup] 已还原 %s -> %s", backup_id, target)
+        _log.info("[backup] 已还原 %s -> %s (缓存 %d 个/%.1f MB)",
+                  backup_id, target, restored_cache_files, restored_cache_bytes / 1e6)
         return {
             "ok": True,
             "target": str(target),
             "file_count": int(r.get("file_count", 0)),
+            "cache_file_count": restored_cache_files,
+            "cache_bytes": restored_cache_bytes,
             "backup_of_old": str(moved_old) if moved_old else None,
         }
 

@@ -1,4 +1,4 @@
-﻿<!-- ============================================================
+<!-- ============================================================
   Spire Mod Manager — 前端模板 (Vue 3 Options-style, 零构建)
   布局: 顶栏 + 四栏面板 (预览 | 停用列表 | 启用列表 | 整合包/皮肤/卡面/备份)
   设计稿: 即时设计 (js.design)
@@ -36,61 +36,44 @@
       <button class="btn-ghost" @click="openSettings">⚙ {{ t('settings') }}</button>
     </header>
 
-    <!-- 右上角悬浮提示 -->
+    <!-- 右上角悬浮提示：仅提示类信息 -->
     <div class="toast-container">
-      <div v-for="t in toasts" :key="t.id" class="toast">{{ t.text }}</div>
+      <div
+        v-for="item in toasts"
+        :key="item.id"
+        class="toast"
+        :class="'toast-' + item.type"
+        @mouseenter="pauseToast(item)"
+        @mouseleave="resumeToast(item)"
+      >
+        <span class="toast-text">{{ item.text }}</span>
+        <button class="toast-close" type="button" :title="t('close')" @click.stop="dismissToast(item.id, true)">✕</button>
+      </div>
     </div>
 
-    <!-- 右上角预览下载进度条 -->
-    <div class="corner-progress-container">
-      <div v-if="previewProgress.show" class="corner-progress">
-        <div class="corner-progress-text">{{ previewProgress.name }}</div>
-        <div class="corner-progress-track">
-          <div class="corner-progress-fill" :style="{ width: previewProgress.percent + '%' }"></div>
+    <!-- 正下方只显示一条最高优先级任务；右上角角标显示并发任务数 -->
+    <div v-if="currentProgressCard" class="progress-stack">
+      <div class="progress-card">
+        <div class="progress-text">
+          <span class="progress-title">{{ currentProgressCard.title }}</span>
+          <span v-if="currentProgressCard.countText" class="progress-count">{{ currentProgressCard.countText }}</span>
+        </div>
+        <div class="progress-track">
+          <div v-if="currentProgressCard.indeterminate" class="progress-fill indeterminate"></div>
+          <div
+            v-else
+            class="progress-fill"
+            :class="currentProgressCard.fillClass"
+            :style="{ width: currentProgressCard.percent + '%' }"
+          ></div>
         </div>
       </div>
-      <div v-if="bulkProgress.show" class="corner-progress">
-        <div class="corner-progress-text">{{ t('bulk_downloading_soft') }}</div>
-        <div class="corner-progress-track">
-          <div class="corner-progress-fill" :style="{ width: bulkProgress.total ? (bulkProgress.done / bulkProgress.total * 100) + '%' : '0%' }"></div>
-        </div>
-      </div>
-      <div v-if="backupBusy.show" class="corner-progress">
-        <div class="corner-progress-text">{{ backupBusy.text }}</div>
-        <div class="corner-progress-track">
-          <div class="corner-progress-fill indeterminate"></div>
-        </div>
-      </div>
     </div>
-
-    <!-- DLL 分析进度条（中下方） -->
-    <div v-if="dllProgress.show" class="dll-progress-bar">
-      <div class="dll-progress-text">{{ dllProgress.current ? dllProgress.current + ' ' + t('analyzing') : t('analyzing_dll') }}</div>
-      <div class="dll-progress-track">
-        <div class="dll-progress-fill" :style="{ width: dllProgress.total ? (dllProgress.done / dllProgress.total * 100) + '%' : '0%' }"></div>
-      </div>
-    </div>
-
-    <!-- 扫描进度条（中下方） -->
-    <div v-if="scanProgress.show" class="dll-progress-bar scan-progress-bar">
-      <div class="dll-progress-text">{{ t({ fetch_deps: 'scan_stage_deps', finalize: 'scan_stage_finalize' }[scanProgress.stage] || 'scanning') }} {{ scanProgress.current }}</div>
-      <div class="dll-progress-track">
-        <div class="dll-progress-fill scan-progress-fill" :style="{ width: scanProgress.total ? (scanProgress.done / scanProgress.total * 100) + '%' : '0%' }"></div>
-      </div>
-    </div>
-
-    <!-- 后台快速预览图进度（全局底部，启动后自动跑一次） -->
-    <div v-if="bgProgress.show" class="dll-progress-bar bg-progress-bar">
-      <div class="dll-progress-text">
-        <span v-if="bgProgress.phase1.total < 0">{{ t('bg_fill_preparing') }}</span>
-        <span v-else-if="bgProgress.phase1.running">{{ t('bg_fill_phase1') }} {{ bgProgress.phase1.done }}/{{ bgProgress.phase1.total }}</span>
-        <span v-else>{{ t('bg_fill_done') }} {{ bgProgress.phase1.done }}/{{ Math.max(bgProgress.phase1.total, 0) }}</span>
-      </div>
-      <div class="dll-progress-track">
-        <div v-if="bgProgress.phase1.total < 0" class="dll-progress-fill indeterminate"></div>
-        <div v-else class="dll-progress-fill bg-phase1" :style="{ width: (bgProgress.phase1.total > 0 ? (bgProgress.phase1.done / bgProgress.phase1.total * 100) : 0) + '%' }"></div>
-      </div>
-    </div>
+    <div
+      v-if="progressTaskCount > 1"
+      class="progress-badge"
+      :title="t('tasks_running', { n: progressTaskCount })"
+    >{{ progressTaskCount }}</div>
 
     <!-- 工坊订阅登记读取失败提示（FIX-6） -->
     <div v-if="state.subscribed_known === false" class="subscribed-warn">
@@ -226,6 +209,20 @@
               <div v-if="workshop.loading" class="ws-loading">{{ t('ws_loading') }}</div>
               <div v-else-if="workshop.error" class="ws-error">{{ t('ws_error') }}{{ workshop.error }}</div>
               <!-- Per-field fallback：workshop 描述有效才用，否则退回本地 manifest，最后用带依赖信息的 selectedDesc 兜底 -->
+              <!-- 简介标题 + 分界线；提示与手动按钮在分界线上方靠右，抓取中自动收起 -->
+              <div v-if="effectiveDescription || selectedDesc" class="ws-desc-head">
+                <span class="ws-desc-title">{{ t('mod_intro') }}</span>
+                <span v-if="canFetchTranslation" class="ws-desc-actions">
+                  <span class="ws-translate-hint">{{ translationHint }}</span>
+                  <button
+                    class="ws-translate-btn"
+                    type="button"
+                    :disabled="translationBusy"
+                    @click="fetchCommunityTranslation"
+                  >{{ t('fetch_community_translation') }}</button>
+                </span>
+              </div>
+              <div v-if="effectiveDescription || selectedDesc" class="ws-desc-divider"></div>
               <div v-if="effectiveDescription" class="ws-desc" v-html="effectiveDescription"></div>
               <div v-else-if="selectedDesc" class="preview-desc">{{ selectedDesc }}</div>
 
@@ -265,8 +262,8 @@
           <li v-for="m in displayList(filteredDisabled, 'disabled', disabledSearch)" :key="'d-'+m.__version_key"
               class="mod-item disabled-item"
               :data-ver-key="m.__version_key"
-              :class="{ selected: selected && selected.__version_key === m.__version_key }"
-              @click="select(m, 'disabled')"
+              :class="{ selected: selected && selected.__version_key === m.__version_key, 'multi-selected': multiSelected.includes(m.__version_key) }"
+              @click="select(m, 'disabled', $event)"
               @dblclick="dblClickHandler(m)"
               @contextmenu.prevent="openMenu($event, m)"
               :title="m.install_path || ''">
@@ -305,12 +302,13 @@
                 :data-ver-key="m.__version_key"
                 :class="{
                   selected: selected && selected.__version_key === m.__version_key,
+                  'multi-selected': multiSelected.includes(m.__version_key),
                   'warn-item': m.has_dep_warning,
                   dragging: drag.active && drag.fromMod && drag.fromMod.__version_key === m.__version_key,
                   'dup-warn': m.dep_flags && m.dep_flags.includes('dup_warn'),
                 }"
                 :style="m.mod_color ? { color: m.mod_color } : {}"
-                @click="select(m, 'enabled')"
+                @click="select(m, 'enabled', $event)"
                 @dblclick="dblClickHandler(m)"
                 @contextmenu.prevent="openMenu($event, m)"
                 :title="m.install_path || ''">
@@ -444,6 +442,7 @@
         </div>
         <div v-if="packTab !== 'backups'" class="btn-row">
           <button class="btn btn-icon" :title="t('clear_enabled_tip')" @click="clearEnabled">🔄</button>
+          <span v-if="multiSelectedCount > 0" class="multi-indicator">{{ t('multi_selected', { n: multiSelectedCount }) }}</span>
           <!-- P0: Steam ID 显示 -->
           <span v-if="state.steam_id" class="steam-id-badge" :title="'当前写入 settings.save 的账号: ' + state.steam_id">{{ state.steam_id }}</span>
           <button class="btn btn-launch" @click="launch">{{ launchText }}</button>
@@ -663,6 +662,14 @@
                   <button class="lang-btn" :class="{ active: settings.form.language === 'zh' }" @click="settings.form.language = 'zh'">{{ t('lang_zh') }}</button>
                   <button class="lang-btn" :class="{ active: settings.form.language === 'en' }" @click="settings.form.language = 'en'">{{ t('lang_en') }}</button>
                 </div>
+              </div>
+              <div class="settings-section">
+                <div class="settings-section-title">{{ t('ws_fill_title') }}</div>
+                <div class="settings-desc">{{ t('ws_fill_desc') }}</div>
+                <label class="p0-check">
+                  <input type="checkbox" v-model="settings.form.workshop_html_fill" />
+                  <span>{{ t('ws_fill_label') }}</span>
+                </label>
               </div>
               <div class="btn-row right">
                 <button class="btn btn-launch" @click="saveSettings">{{ t('save') }}</button>

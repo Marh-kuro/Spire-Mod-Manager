@@ -25,10 +25,17 @@ _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 
 _CACHE_VERSION = 3  # v3 缓存；HTML fallback 在缓存命中后按需触发，不需要 version bump 强制重抓
 
-# 缓存策略（7 天、1 天）
-_DEPS_CACHE_TTL = 7 * 24 * 3600    # 依赖缓存 7 天（workshop 依赖极少变化）
+# 缓存策略（30 天、1 天）
+_DEPS_CACHE_TTL = 30 * 24 * 3600   # 依赖缓存 30 天；time_updated 变化时提前失效
 _META_CACHE_TTL = 24 * 3600        # 元数据缓存 1 天（标题/描述/标签偶尔更新）
 _TITLE_RETRY_TTL = 7 * 24 * 3600   # 标题轻量缓存失败时 7 天后重试
+
+# 失败退避：连续失败按 10 分钟 → 20 分钟 → 40 分钟 → … → 24 小时封顶
+_DEPS_RETRY_BASE = 600
+_DEPS_RETRY_CAP = 24 * 3600
+
+# 手动开关：False 时停止一切社区页 HTML 抓取（依赖与中文描述都只用本地缓存）
+_HTML_FILL_ENABLED = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -49,9 +56,10 @@ _HTML_MAX_RECHECK_DAYS = 30  # 预判层最大重检间隔 —— 社区翻译�
 # ── HTML 熔断：检测到 429/403 → 冷却期内所有 HTML 请求直接返回 None ──
 _HTML_CIRCUIT_OPEN_TS = 0.0   # 熔断开启的时间戳
 _HTML_CIRCUIT_COOLDOWN = 600.0  # 冷却 10 分钟
-_html_inflight: set[str] = set()  # 正在爬的 wid（去重）
-_html_lock = threading.Lock()
-_html_sem = threading.Semaphore(1)  # 并发上限：desc 回退路径同一时刻只有 1 个后台爬
+_HTML_REUSE_TTL = 20.0        # 同一 wid 的 HTML 复用窗口，避免 deps/desc 重复抓同一页
+_html_gate_lock = threading.Lock()   # 全局 HTML 请求门：deps + desc 共用，保证只有 1 个请求在飞
+_html_throttle_lock = threading.Lock()
+_html_recent: dict[tuple[str, str], tuple[float, Optional[str], str]] = {}
 
 
 def _html_circuit_open() -> bool:
@@ -72,30 +80,105 @@ def _html_circuit_trigger() -> None:
     _log.warning("[workshop] ⚠️ HTML 熔断触发！冷却 %.0fs（社区页被风控）", _HTML_CIRCUIT_COOLDOWN)
 
 
+def set_html_fill_enabled(enabled: bool) -> None:
+    """手动开关：关闭后不再发起任何社区页 HTML 请求。"""
+    globals()['_HTML_FILL_ENABLED'] = bool(enabled)
+    _log.info("[workshop] 工坊页面自动补全：%s", "开启" if enabled else "关闭")
+
+
+def is_html_fill_enabled() -> bool:
+    return bool(_HTML_FILL_ENABLED)
+
+
 def _html_throttle() -> None:
-    """社区页 HTML 爬取统一节流（2.0s 间隔）。deps 和 desc 共用。"""
-    if _html_circuit_open():
-        raise RuntimeError("HTML circuit breaker open — cooldown in effect")
-    global _HTML_LAST_TS
-    now = time.monotonic()
-    delay = _HTML_LAST_TS + _HTML_MIN_INTERVAL - now
-    if delay > 0:
-        _log.debug("[workshop] throttle wait %.2fs", delay)
-        time.sleep(delay)
-    _HTML_LAST_TS = time.monotonic()
+    """社区页 HTML 爬取统一节流（2.0s 间隔）。deps 和 desc 共用。
 
-
-# 兼容旧名字
-_deps_throttle = _html_throttle
+    锁覆盖“检查 + sleep + 更新时间戳”，保证两个线程不会同时通过节流检查。
+    sleep 放在锁内是刻意的：HTML 请求本来就串行，这里让后来者排队而不是一起穿透。
+    """
+    with _html_throttle_lock:
+        if _html_circuit_open():
+            raise RuntimeError("HTML circuit breaker open — cooldown in effect")
+        global _HTML_LAST_TS
+        now = time.monotonic()
+        delay = _HTML_LAST_TS + _HTML_MIN_INTERVAL - now
+        if delay > 0:
+            _log.debug("[workshop] throttle wait %.2fs", delay)
+            time.sleep(delay)
+        _HTML_LAST_TS = time.monotonic()
 
 
 # ──────────────────────────────────────────────────────────────── 辅助函数 ──
 _CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 _CJK_TOTAL_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")  # CJK 统一符号（中文标点等）
 
-_HTML_ZH_MIN_RATIO = 0.10  # desc 中文占比低于这个阈值 → 主体不是中文，触发 HTML 补全
+_HTML_ZH_MIN_RATIO = 0.10  # HTML 正文可接受的最低中文占比（仅用于替换展示）
                            # 作者可能在英文 desc 里混了几个字（QQ群号、昵称），
                            # 让简单的 _has_chinese() 误判为"已有中文"
+
+# 是否值得为了描述抓 HTML 的分档阈值（分母为有效文字字符）
+_ZH_RATIO_ENOUGH = 0.30   # ≥ 30% 视为作者已提供可读中文，不抓
+_ZH_RATIO_WEAK = 0.15     # 15%~30% 视为双语/中文偏少，不自动抓
+_MIN_VALID_CHARS = 40     # 有效文字字符少于此值不判定
+_MIXED_GAP = 0.10         # 两种脚本占比差距小于此值判 mixed
+_DESC_LANG_VERSION = 2    # 语言判定算法版本；旧缓存命中时本地重算并回填
+
+_VALID_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04ff]")
+_BBCODE_TAG_RE = re.compile(r"\[/?[a-zA-Z][^\]]*\]")
+_URL_RE = re.compile(r"https?://[^\s<>\[\]\"']+", re.IGNORECASE)
+
+
+def _norm_desc(s: str) -> str:
+    """用于判断两次抓到的描述是否真的不同，忽略空白差异。"""
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _desc_language(s: str) -> tuple[str, float]:
+    """返回 (主脚本, 中文占比)。分母只计可见文字，排除空白/数字/标点/BBCode/链接。"""
+    text = _BBCODE_TAG_RE.sub(" ", s or "")
+    text = _URL_RE.sub(" ", text)
+    valid = _VALID_LETTER_RE.findall(text)
+    n = len(valid)
+    if n == 0:
+        return "unknown", 0.0
+    han = len(_HAN_RE.findall(text))
+    ratio = han / n
+    if n < _MIN_VALID_CHARS:
+        return ("zh" if han > 0 else "unknown"), ratio
+    counts = {
+        "zh": han,
+        "ko": len(_HANGUL_RE.findall(text)),
+        "ja": len(_KANA_RE.findall(text)),
+        "ru": len(_CYRILLIC_RE.findall(text)),
+    }
+    counts["latin"] = max(0, n - sum(counts.values()))
+    ordered = sorted(counts.values(), reverse=True)
+    top = max(counts, key=counts.get)
+    if ordered[0] / n < 0.60 and (ordered[0] - ordered[1]) / n < _MIXED_GAP:
+        return "mixed", ratio
+    # 日文常与汉字混排：出现假名且假名+汉字过半 → 判日文
+    if counts["ja"] > 0 and (counts["ja"] + han) / n >= 0.50:
+        return "ja", ratio
+    return top, ratio
+
+
+def _desc_gate(desc: str, language: str = "zh") -> str:
+    """描述是否值得自动抓 HTML：enough / bilingual / no_translation / 语言名 / non_zh / missing。"""
+    if language != "zh":
+        return "non_zh"
+    text = (desc or "").strip()
+    if not text:
+        return "missing"
+    lang, ratio = _desc_language(text)
+    if ratio >= _ZH_RATIO_ENOUGH:
+        return "enough"
+    if ratio >= _ZH_RATIO_WEAK:
+        return "bilingual"
+    return lang  # ko / ja / ru / latin / mixed / unknown
 
 
 def _has_enough_chinese(s: str) -> bool:
@@ -404,33 +487,56 @@ def reset_bg_progress() -> None:
 # 旧代码：enqueue_html_fill / _html_fill_worker / _merge_html_into_cache / needs_title_fetch
 # 旧数据：_html_fill_queue / _html_fill_pending / _html_fill_lock / _html_fill_cv / queue import
 # 原因：Web API (language=schinese) 直接返回中文 title/desc/tags/preview_url — 零 HTML 爬取
-#       唯一保留的 HTML 爬取是 fetch_workshop_dependencies
+#       HTML 只用于：1) 依赖关系 RequiredItems；2) 中文正文兜底 workshopItemDescription
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 def _fetch_html(workshop_id: str, language: str = "zh") -> tuple[Optional[str], str]:
-    """爬 Steam 社区页 HTML（desc fallback / deps 共用）。带节流 + 429 熔断 + 分级退避。
+    """全局 HTML 请求入口：deps 和 desc 共用同一把门 + 同一份近期结果。
+
+    同一 wid 在 20s 内只发一次请求；并发的 deps/desc 请求会排队，
+    后到者直接复用前一次结果，避免同一个社区页被抓两遍。
+    """
+    key = (str(workshop_id), _to_steam_lang(language))
+    with _html_gate_lock:
+        now = time.monotonic()
+        recent = _html_recent.get(key)
+        if recent is not None and now - recent[0] < _HTML_REUSE_TTL:
+            _log.debug("[workshop] wid=%s 复用近期 HTML 结果 (%s)", workshop_id, recent[2])
+            return recent[1], recent[2]
+
+        if _html_circuit_open():
+            _log.debug("[workshop] wid=%s 熔断开启，跳过 HTML 爬取", workshop_id)
+            return None, "circuit_open"
+
+        try:
+            _html_throttle()
+        except RuntimeError:
+            _log.debug("[workshop] wid=%s 熔断开启，跳过 HTML 爬取", workshop_id)
+            return None, "circuit_open"
+
+        html, reason = _fetch_html_direct(workshop_id, language)
+        _html_recent[key] = (time.monotonic(), html, reason)
+        # 只保留最近 200 条，避免长期运行后字典无限增长
+        while len(_html_recent) > 200:
+            _html_recent.pop(next(iter(_html_recent)))
+        return html, reason
+
+
+def _fetch_html_direct(workshop_id: str, language: str = "zh") -> tuple[Optional[str], str]:
+    """真正请求 Steam 社区页。调用方必须持有 _html_gate_lock。
 
     返回 (html_text, reason):
       - 成功: (HTML 字符串, "ok")
       - 失败: (None, 原因码)
         原因码:
           "circuit_open"    — 熔断已开（入口或循环中被别的 mod 触发）
-          "429_circuit"     — 429 重试耗尽 → 本 mod 触发了熔断
+          "429_circuit"     — 首次 429 立即触发熔断，不再逐 mod 重试
           "403_circuit"     — 403 → 本 mod 触发了熔断
           "http_<code>"     — 其他 HTTP 错误
           "connection"      — 连接重置重试耗尽
           "exception"       — 其他异常
-
-    调用方靠 reason 判断"本次失败算不算真没中文"，不靠事后查全局熔断——
-    避免"别的 mod 触发熔断导致这个 mod 被误判"的竞态。
     """
-    try:
-        _deps_throttle()  # 内部会检查熔断
-    except RuntimeError:
-        _log.debug("[workshop] wid=%s 熔断开启，跳过 HTML 爬取", workshop_id)
-        return None, "circuit_open"
-
     steam_lang = _to_steam_lang(language)
     url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}&l={steam_lang}"
     headers = {
@@ -449,16 +555,9 @@ def _fetch_html(workshop_id: str, language: str = "zh") -> tuple[Optional[str], 
                 return resp.read().decode("utf-8", "ignore"), "ok"
         except urllib.error.HTTPError as he:
             if he.code == 429:
-                # 指数退避：0.5s → 1s
-                if attempt < max_retries:
-                    wait = 0.5 * (2 ** attempt)
-                    _log.warning("[workshop] wid=%s HTTP 429，%.1fs 后重试 (%d/%d)",
-                                 workshop_id, wait, attempt + 1, max_retries)
-                    time.sleep(wait)
-                    _deps_throttle()
-                    continue
+                # 首次 429 就全局熔断：在并发风暴里继续单请求重试只会放大风控
                 _html_circuit_trigger()
-                _log.warning("[workshop] wid=%s HTTP 429 重试耗尽，触发熔断", workshop_id)
+                _log.warning("[workshop] wid=%s HTTP 429，立即触发全局熔断", workshop_id)
                 return None, "429_circuit"
             if he.code == 403:
                 _html_circuit_trigger()
@@ -481,121 +580,8 @@ def _fetch_html(workshop_id: str, language: str = "zh") -> tuple[Optional[str], 
 
 def _launch_async_html_fill(workshop_id: str, language: str, *,
                            api_time_updated: int = 0) -> None:
-    """后台 daemon 线程：爬 HTML 社区页补中文 desc，落盘后前端轮询自动刷新。
-
-    预判层（零网络成本）：
-      - 缓存已有中文 desc → 不爬
-      - html_checked=True 且 html_time_updated 和 Web API/steamDB 一致 → mod 没更新过
-        额外检查：距上次 HTML 检查 < 30 天 → 真跳过
-        （30 天过了强制重检 —— 社区翻译是其他用户贡献的，不触发 mod time_updated）
-      - steamDB 查询零 HTTP（1.4MB 本地 JSON）
-
-    风控层：
-      - 熔断开启 → 不启动（冷却 10 分钟）
-      - 同一个 wid 正在爬 → 不重复启动（去重）
-      - _html_throttle 1.5s 间隔 → 多线程串行
-      - _fetch_html 分级退避（429 指数重试 → 连接重置短延时 → 超时 30s）
-
-    失败不永久放弃：
-      - 429/403 熔断耗尽 → 不标记 html_checked=True，只记 html_last_checked_ts
-        （下次预览或批量补全还能再试）
-      - 其他失败（社区真没中文、HTML 解析失败）→ 正常标记 html_checked=True
-    """
-    if _html_circuit_open():
-        _log.debug("[workshop] wid=%s 熔断开启，跳过后台 HTML 补全", workshop_id)
-        return
-    with _html_lock:
-        if workshop_id in _html_inflight:
-            _log.debug("[workshop] wid=%s 后台 HTML 已在进行中，跳过", workshop_id)
-            return
-        _html_inflight.add(workshop_id)
-
-    def _do():
-        with _html_sem:
-            try:
-                # ── 预判层：time_updated 没变 + 30 天内检查过 → 不爬 ──
-                check_time = int(api_time_updated or 0)
-                if check_time <= 0:
-                    # 没传 Web API 的值 → 查 steamDB（零网络成本）
-                    try:
-                        from .steam_webapi import query_steamdb
-                        snap = query_steamdb(workshop_id)
-                        if snap:
-                            check_time = int(snap.get("time_updated") or 0)
-                    except Exception:
-                        pass
-
-                cached_before = _load_cached(workshop_id, language)
-                if cached_before and check_time > 0 and cached_before.get("html_checked"):
-                    cached_time = cached_before.get("html_time_updated")
-                    if cached_time == check_time:
-                        # mod 没更新过，再看距上次检查多久
-                        last_checked = float(cached_before.get("html_last_checked_ts") or 0)
-                        days_since = max(0, (time.time() - last_checked) / 86400) if last_checked > 0 else 0
-                        if days_since < _HTML_MAX_RECHECK_DAYS:
-                            from datetime import datetime, timezone
-                            ts_str = datetime.fromtimestamp(last_checked, tz=timezone.utc).strftime("%Y-%m-%d") if last_checked > 0 else "never"
-                            _log.debug("[workshop] wid=%s time_updated 没变 (%d) 且 %.1f 天内检查过 (上次=%s) → 跳过",
-                                       workshop_id, check_time, days_since, ts_str)
-                            return
-                        _log.debug("[workshop] wid=%s time_updated 没变 (%d) 但已过 %.0f 天 → 强制重检",
-                                   workshop_id, check_time, days_since)
-
-                # ── 正式爬取 ──
-                html_text, fetch_reason = _fetch_html(workshop_id, language)
-
-                # 只有 fetch_reason=="ok" 且提取到中文 desc 才算成功
-                # 任何其他情况都走到下面的"判断是否临时失败"分支
-                if fetch_reason == "ok" and html_text is not None:
-                    html_desc = _extract_html_description(html_text)
-                    if html_desc and _has_chinese(html_desc):
-                        cached = _load_cached(workshop_id, language)
-                        if cached:
-                            cached["description"] = html_desc
-                            cached["desc_src"] = "html"
-                            cached["html_checked"] = True
-                            cached["html_time_updated"] = check_time
-                            cached["html_last_checked_ts"] = time.time()
-                            _save_cache(workshop_id, cached, None, "image/jpeg")
-                            _log.info("[workshop] wid=%s 后台 HTML 补中文 desc 完成", workshop_id)
-                            return
-
-                # 到这里: 要么 fetch_reason!="ok"（临时失败），要么 fetch_reason=="ok"
-                # 但社区 HTML 里确实没有中文 desc（作者没填 + 社区翻译系统也没覆盖）
-                cached = _load_cached(workshop_id, language)
-                if not cached:
-                    return
-
-                # 判断是不是临时失败（值得保留重试机会，不标记 html_checked=True）
-                # 临时: 熔断类、HTTP 错误、连接抖动、任意 exception（偶发异常按临时处理）
-                # 只有 fetch_reason=="ok" 但 HTML 里真没中文 → 唯一确认"没翻译"的路径
-                _TEMP_FAILURES = {"429_circuit", "403_circuit", "circuit_open", "connection", "exception"}
-                is_temp_failure = (
-                    fetch_reason in _TEMP_FAILURES
-                    or fetch_reason.startswith("http_")
-                )
-
-                if is_temp_failure:
-                    cached["html_last_checked_ts"] = time.time()
-                    cached.pop("html_checked", None)  # 删掉 → 下次还能进预判层
-                    _save_cache(workshop_id, cached, None, "image/jpeg")
-                    _log.warning("[workshop] wid=%s HTML 临时失败 (reason=%s) → 不标记已检查，保留重试机会",
-                                 workshop_id, fetch_reason)
-                else:
-                    # 正常情况：社区真没中文 desc 或 HTML 解析失败 → 标记已检查
-                    cached["html_checked"] = True
-                    cached["html_time_updated"] = check_time
-                    cached["html_last_checked_ts"] = time.time()
-                    _save_cache(workshop_id, cached, None, "image/jpeg")
-                    _log.debug("[workshop] wid=%s 后台 HTML 未拿到中文 desc（已标记跳过, reason=%s）",
-                               workshop_id, fetch_reason)
-            except Exception as e:
-                _log.debug("[workshop] wid=%s 后台 HTML 补全失败: %s", workshop_id, e)
-            finally:
-                with _html_lock:
-                    _html_inflight.discard(workshop_id)
-
-    threading.Thread(target=_do, daemon=True).start()
+    """兼容旧调用：统一走 HTML 单消费者队列，立即返回。"""
+    ensure_html(workshop_id, language, api_time_updated=api_time_updated, reason="desc")
 
 
 def _download_image_bytes(url: str, max_bytes: int = 2_000_000, retries: int = 2) -> Optional[tuple[bytes, str]]:
@@ -636,14 +622,352 @@ def _download_image_bytes(url: str, max_bytes: int = 2_000_000, retries: int = 2
             return None
 
 
+def _parse_dependencies_html(html_text: str) -> list[dict]:
+    """从社区页 RequiredItems 区域解析依赖，按 workshop_id 去重。"""
+    deps: list[dict] = []
+    seen_ids: set[str] = set()
+    container_match = re.search(
+        r'id="RequiredItems"[^>]*>(.*?)(?:</div>\s*</div>\s*</div>\s*<!--\s*created by|$)',
+        html_text, re.DOTALL | re.IGNORECASE
+    )
+    if not container_match:
+        return deps
+    for link in re.finditer(
+        r'href="https?://steamcommunity\.com/(?:workshop/)?filedetails/\?id=(\d+)"[^>]*>(.*?)</a>',
+        container_match.group(1), re.DOTALL | re.IGNORECASE
+    ):
+        dep_wid = link.group(1)
+        dep_name = html.unescape(re.sub(r'<[^>]+>', '', link.group(2))).strip()
+        if dep_wid and dep_wid not in seen_ids:
+            seen_ids.add(dep_wid)
+            deps.append({"workshop_id": dep_wid, "name": dep_name})
+    return deps
+
+
+def _write_deps_cache(workshop_id: str, deps: list[dict], *,
+                      time_updated: int = 0, status: str = "cached") -> None:
+    """写 deps.json；失败时记录连续失败次数与下次重试时间（指数退避）。"""
+    try:
+        d = _cache_dir(workshop_id)
+        d.mkdir(parents=True, exist_ok=True)
+        prev = _read_deps(workshop_id) or {}
+        fail_count = 0
+        next_retry = 0
+        if status == "failed":
+            fail_count = int(prev.get("deps_fail_count") or 0) + 1
+            delay = min(_DEPS_RETRY_BASE * (2 ** (fail_count - 1)), _DEPS_RETRY_CAP)
+            next_retry = int(time.time() + delay)
+        _deps_path(workshop_id).write_text(json.dumps({
+            "dependencies": deps,
+            "deps_fetched_at": int(time.time()),
+            "deps_time_updated": int(time_updated or 0),
+            "deps_status": status,
+            "deps_fail_count": fail_count,
+            "deps_next_retry_ts": next_retry,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        _log.warning("[workshop] 依赖缓存写失败: %s", e)
+
+
+def _deps_in_backoff(workshop_id: str) -> bool:
+    """上次抓取失败且仍在退避窗口内 → 暂不重试。"""
+    cached = _read_deps(workshop_id) or {}
+    if cached.get("deps_status") != "failed":
+        return False
+    return float(cached.get("deps_next_retry_ts") or 0) > time.time()
+
+
+def _deps_cache_fresh(workshop_id: str, api_time_updated: int = 0) -> bool:
+    """30 天 TTL；若工坊快照的 time_updated 比缓存新，立即判定失效。"""
+    cached = _read_deps(workshop_id)
+    if not cached or "dependencies" not in cached:
+        return False
+    if cached.get("deps_status") not in (None, "cached"):
+        return False
+    if _deps_in_backoff(workshop_id):
+        return False
+    cached_time = int(cached.get("deps_time_updated") or 0)
+    if api_time_updated > 0 and cached_time > 0 and api_time_updated > cached_time:
+        return False
+    fetched_at = float(cached.get("deps_fetched_at") or 0)
+    return time.time() - fetched_at < _DEPS_CACHE_TTL
+
+
+def _resolve_time_updated(workshop_id: str, api_time_updated: int = 0) -> int:
+    if api_time_updated > 0:
+        return int(api_time_updated)
+    try:
+        from .steam_webapi import query_steamdb
+        snap = query_steamdb(str(workshop_id))
+        if snap:
+            return int(snap.get("time_updated") or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _desc_needs_fetch(workshop_id: str, language: str, api_time_updated: int = 0) -> bool:
+    """自动抓取描述的门控。
+
+    非中文界面不抓；中文占比 ≥15%（足够或双语）不自动抓，留给手动入口；
+    原文为外语（<15%）时：本轮版本从未试过 HTML → 自动抓一次；
+    已试过且无中文 → 只在 mod 更新或超过 30 天后重检。
+    """
+    if language != "zh":
+        return False
+    cached = _load_cached(workshop_id, language)
+    if cached is None:
+        return True
+    desc = cached.get("description") or ""
+    ratio = cached.get("zh_ratio")
+    if cached.get("desc_lang_v") != _DESC_LANG_VERSION or ratio is None:
+        _, ratio = _desc_language(desc)
+        cached["zh_ratio"] = round(ratio, 4)
+    if ratio >= _ZH_RATIO_WEAK:
+        return False  # ≥15%：足够或双语，都不自动抓
+    if not cached.get("html_checked"):
+        return True  # 从未试过社区页：自动抓一次
+    check_time = _resolve_time_updated(workshop_id, api_time_updated)
+    if check_time > 0 and int(cached.get("html_time_updated") or 0) != check_time:
+        return True  # mod 更新过，重新检查
+    last_checked = float(cached.get("html_last_checked_ts") or 0)
+    days = (time.time() - last_checked) / 86400 if last_checked > 0 else _HTML_MAX_RECHECK_DAYS
+    return days >= _HTML_MAX_RECHECK_DAYS
+
+
+def _fetch_workshop_page(workshop_id: str, language: str = "zh", *,
+                         api_time_updated: int = 0,
+                         need_deps: bool = True,
+                         need_desc: bool = True,
+                         force: bool = False) -> dict:
+    """一次 HTML 拉取，同时解析依赖和中文描述，并写回各自现有缓存。
+
+    force=True 仅用于用户手动触发：绕过“中文占比不足不自动抓”的门控，
+    但仍复用已缓存的中文描述，不做无意义重抓。
+    """
+    wid = str(workshop_id)
+    check_time = _resolve_time_updated(wid, api_time_updated)
+
+    if not is_html_fill_enabled() and not force:
+        return {"reason": "disabled", "deps": None, "desc_updated": False, "desc_state": "disabled"}
+
+    _migrate_legacy_meta(wid)
+    if need_deps and (_deps_in_backoff(wid) or _deps_cache_fresh(wid, check_time)):
+        need_deps = False
+    if need_desc and not force and not _desc_needs_fetch(wid, language, check_time):
+        need_desc = False
+    if not need_deps and not need_desc:
+        return {"reason": "cached", "deps": None, "desc_updated": False, "desc_state": "skipped"}
+
+    html_text, fetch_reason = _fetch_html(wid, language)
+    if fetch_reason != "ok" or html_text is None:
+        if need_deps:
+            _write_deps_cache(wid, (_read_deps(wid) or {}).get("dependencies", []),
+                              time_updated=check_time, status="failed")
+        return {"reason": fetch_reason, "deps": None, "desc_updated": False, "desc_state": "failed"}
+
+    deps = _parse_dependencies_html(html_text) if need_deps else None
+    if need_deps:
+        _write_deps_cache(wid, deps or [], time_updated=check_time, status="cached")
+
+    desc_updated = False
+    desc_state = "skipped"
+    # 页面已经抓到（无论因为依赖还是手动），描述是免费附带的：顺手解析并落缓存
+    if language == "zh" and (need_desc or need_deps):
+        html_desc = _extract_html_description(html_text)
+        cached = _load_cached(wid, language)
+        if cached is not None:
+            if html_desc and _has_chinese(html_desc):
+                old_desc = cached.get("description") or ""
+                same = _norm_desc(html_desc) == _norm_desc(old_desc)
+                if not same:
+                    lang, ratio = _desc_language(html_desc)
+                    cached["description"] = html_desc
+                    cached["desc_src"] = "html"
+                    cached["desc_lang"] = lang
+                    cached["zh_ratio"] = round(ratio, 4)
+                    cached["is_bilingual"] = _ZH_RATIO_WEAK <= ratio < _ZH_RATIO_ENOUGH
+                    desc_updated = True
+                    desc_state = "updated"
+                else:
+                    desc_state = "same"
+                cached["desc_lang_v"] = _DESC_LANG_VERSION
+                cached["no_translation"] = False
+                cached["html_checked"] = True
+                cached["html_time_updated"] = check_time
+                cached["html_last_checked_ts"] = time.time()
+                cached["html_desc_state"] = desc_state
+                _save_cache(wid, cached, None, "image/jpeg")
+                _log.info("[workshop] wid=%s %s", wid,
+                          "中文描述已补全（来源=工坊页）" if not same
+                          else "社区页中文与现有正文一致，未更新")
+            else:
+                api_desc = cached.get("description") or ""
+                lang, ratio = _desc_language(api_desc)
+                cached["desc_lang"] = lang
+                cached["zh_ratio"] = round(ratio, 4)
+                cached["is_bilingual"] = _ZH_RATIO_WEAK <= ratio < _ZH_RATIO_ENOUGH
+                cached["desc_lang_v"] = _DESC_LANG_VERSION
+                cached["no_translation"] = True
+                cached["no_translation_at"] = time.time()
+                cached["html_checked"] = True
+                cached["html_time_updated"] = check_time
+                cached["html_last_checked_ts"] = time.time()
+                cached["html_desc_state"] = "no_translation"
+                _save_cache(wid, cached, None, "image/jpeg")
+                desc_state = "no_translation"
+                _log.info("[workshop] wid=%s 工坊页无中文描述，保留原文（主脚本=%s）", wid, lang)
+    return {"reason": "ok", "deps": deps, "desc_updated": desc_updated, "desc_state": desc_state}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 统一 HTML 后台队列（P1）
+# 启用/预览都只入队，单消费者串行拉取；一次页面同时写 deps + desc。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_HTML_QUEUE_MAX = 50
+_html_queue: list[dict] = []
+_html_queue_cv = threading.Condition()
+_html_queue_worker: Optional[threading.Thread] = None
+_html_queue_active: set[str] = set()
+_html_task_status: dict[str, dict] = {}
+_html_status_seq = 0
+_html_status_seq_lock = threading.Lock()
+
+
+def _set_html_status(workshop_id: str, status: str, reason: str = "") -> None:
+    global _html_status_seq
+    with _html_status_seq_lock:
+        _html_status_seq += 1
+        _html_task_status[str(workshop_id)] = {
+            "status": status,
+            "reason": reason,
+            "seq": _html_status_seq,
+            "updated_at": time.time(),
+        }
+        # 状态表只保留最近 200 个 wid，避免长跑进程无限增长
+        while len(_html_task_status) > 200:
+            oldest = min(_html_task_status, key=lambda w: _html_task_status[w]["seq"])
+            _html_task_status.pop(oldest, None)
+
+
+def _html_queue_loop() -> None:
+    while True:
+        with _html_queue_cv:
+            while not _html_queue:
+                _html_queue_cv.wait()
+            job = _html_queue.pop(0)
+        wid = job["wid"]
+        try:
+            _set_html_status(wid, "running")
+            result = _fetch_workshop_page(
+                wid, job.get("language", "zh"),
+                api_time_updated=job.get("api_time_updated", 0),
+                need_deps=job.get("need_deps", True),
+                need_desc=job.get("need_desc", True),
+                force=job.get("force", False),
+            )
+            reason = result.get("reason", "ok")
+            deps = result.get("deps")
+            desc_label = {
+                "updated": "已更新",
+                "same": "一致",
+                "no_translation": "无中文",
+                "skipped": "无需更新",
+            }.get(result.get("desc_state"), "无需更新")
+            _log.info(
+                "[workshop] 队列完成 wid=%s 结果=%s 依赖=%s 描述=%s",
+                wid, reason,
+                f"{len(deps)}条" if deps is not None else "无需更新",
+                desc_label,
+            )
+            if reason in ("ok", "cached", "disabled"):
+                _set_html_status(wid, "done", reason)
+            else:
+                _set_html_status(wid, "failed", reason)
+        except Exception as e:
+            _log.warning("[workshop] HTML 队列任务失败 wid=%s: %s", wid, e)
+            _set_html_status(wid, "failed", "exception")
+        finally:
+            with _html_queue_cv:
+                _html_queue_active.discard(wid)
+                _html_queue_cv.notify_all()
+
+
+def ensure_html(workshop_id: str, language: str = "zh", *,
+                api_time_updated: int = 0, reason: str = "",
+                force: bool = False) -> dict:
+    """把某个 wid 的 HTML 获取任务放进单消费者队列，立即返回。
+
+    force=True 仅供用户手动触发：绕过“中文占比不足不自动抓”的门控。
+    返回 {"wid", "status", "desc_gate", "desc_lang"}：
+    queued / cached / running / circuit_open / rejected / disabled。
+    """
+    global _html_queue_worker
+    wid = str(workshop_id)
+    if not is_html_fill_enabled() and not force:
+        return {"wid": wid, "status": "disabled", "reason": reason}
+    if _html_circuit_open():
+        return {"wid": wid, "status": "circuit_open", "reason": reason}
+
+    need_deps = not _deps_cache_fresh(wid, api_time_updated) and not _deps_in_backoff(wid)
+    need_desc = bool(force) or _desc_needs_fetch(wid, language, api_time_updated)
+    cached_desc = (_load_cached(wid, language) or {}).get("description") or ""
+    gate = _desc_gate(cached_desc, language)
+    if not need_deps and not need_desc:
+        _set_html_status(wid, "done", "cached")
+        return {"wid": wid, "status": "cached", "desc_gate": gate,
+                "desc_lang": (_desc_language(cached_desc)[0] if cached_desc else "unknown")}
+
+    with _html_queue_cv:
+        if wid in _html_queue_active:
+            return {"wid": wid, "status": "running", "reason": reason}
+        if len(_html_queue) >= _HTML_QUEUE_MAX:
+            return {"wid": wid, "status": "rejected", "reason": "queue_full"}
+        _html_queue_active.add(wid)
+        _html_queue.append({
+            "wid": wid,
+            "language": language,
+            "api_time_updated": int(api_time_updated or 0),
+            "need_deps": need_deps,
+            "need_desc": need_desc,
+            "force": bool(force),
+            "reason": reason,
+        })
+        # 状态写在入队之后、worker 启动之前，避免 worker 先跑完又被改回 queued
+        _set_html_status(wid, "queued", reason)
+        _log.info(
+            "[workshop] 队列入队 wid=%s 触发=%s 依赖=%s 描述=%s",
+            wid, reason or "-",
+            "是" if need_deps else "否",
+            "是" if need_desc else "否",
+        )
+        if _html_queue_worker is None or not _html_queue_worker.is_alive():
+            _html_queue_worker = threading.Thread(
+                target=_html_queue_loop, daemon=True, name="html-queue"
+            )
+            _html_queue_worker.start()
+        _html_queue_cv.notify_all()
+    return {"wid": wid, "status": "queued", "reason": reason}
+
+
+def get_html_tasks() -> dict:
+    """前端轮询：返回任务状态与最近一次完成序号。"""
+    with _html_status_seq_lock:
+        items = {wid: dict(st) for wid, st in _html_task_status.items()}
+        seq = _html_status_seq
+    with _html_queue_cv:
+        pending = [j["wid"] for j in _html_queue]
+    return {"items": items, "pending": pending, "seq": seq, "circuit_open": _html_circuit_open()}
+
+
+
 def fetch_workshop_dependencies(workshop_id: str, timeout: int = 15) -> Optional[list[dict]]:
     """爬 Steam 工坊页面拿依赖列表（HTML 里服务端直接渲染，不需要执行 JS）。
 
-    2026-11-03 重构：这是**唯一**保留的 HTML 爬取场景——Steam Web API 无 key 不返回 dependencies。
-    下次 build_steamdb.py 加 children 字段后 → 优先 steamDB 零 HTTP。
-
-    返回 list[{"workshop_id": "...", "name": "..."}]。失败或没依赖返回 None。
-    缓存 7 天（依赖极少变化）。
+    Steam Web API 无 key 不返回 dependencies；下次 build_steamdb.py 加 children 后
+    可优先走本地快照。返回 list[{"workshop_id": "...", "name": "..."}]。
+    失败返回 None；成功但无依赖返回 []。缓存 7 天。
     """
     wid = str(workshop_id)
 
@@ -667,51 +991,19 @@ def fetch_workshop_dependencies(workshop_id: str, timeout: int = 15) -> Optional
     except Exception:
         pass
 
-    # 缓存（7 天内新鲜 → 直接返回）
+    # 缓存（30 天内新鲜且未过期 time_updated → 直接返回）
     _migrate_legacy_meta(wid)
-    cached = _read_deps(wid)
-    if cached and "dependencies" in cached:
-        fetched_at = cached.get("deps_fetched_at", 0)
-        if time.time() - fetched_at < _DEPS_CACHE_TTL:
-            return cached["dependencies"]
+    cached = _read_deps(wid) or {}
+    if _deps_cache_fresh(wid, _resolve_time_updated(wid)):
+        return cached["dependencies"]
 
-    # HTML 爬取（唯一保留场景）—— throttle 统一在 _fetch_html 内部
-    html_text, _ = _fetch_html(wid)
-    if html_text is None:
-        return None
+    # 手动关闭或失败退避中：只用已有缓存，不发起网络请求
+    if not is_html_fill_enabled() or _deps_in_backoff(wid):
+        return cached.get("dependencies") if "dependencies" in cached else None
 
-    # 4) 从 HTML 里解析 requiredItems 区域的链接
-    #    同一依赖在页面里可能出现多次（缩略图 + 标题链接），按 workshop_id 去重
-    deps: list[dict] = []
-    seen_ids: set[str] = set()
-    container_match = re.search(
-        r'id="RequiredItems"[^>]*>(.*?)(?:</div>\s*</div>\s*</div>\s*<!--\s*created by|$)',
-        html_text, re.DOTALL | re.IGNORECASE
-    )
-    if container_match:
-        container_html = container_match.group(1)
-        for link in re.finditer(
-            r'href="https?://steamcommunity\.com/(?:workshop/)?filedetails/\?id=(\d+)"[^>]*>(.*?)</a>',
-            container_html, re.DOTALL | re.IGNORECASE
-        ):
-            dep_wid = link.group(1)
-            dep_name = html.unescape(re.sub(r'<[^>]+>', '', link.group(2))).strip()
-            if dep_wid and dep_wid not in seen_ids:
-                seen_ids.add(dep_wid)
-                deps.append({"workshop_id": dep_wid, "name": dep_name})
-
-    # 5) 写缓存
-    try:
-        d = _cache_dir(wid)
-        d.mkdir(parents=True, exist_ok=True)
-        _deps_path(wid).write_text(json.dumps({
-            "dependencies": deps,
-            "deps_fetched_at": int(time.time()),
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        _log.warning("[workshop] 依赖缓存写失败: %s", e)
-
-    return deps
+    # 一次 HTML 拉取：依赖 + 中文 desc 同时解析，写回各自缓存
+    result = _fetch_workshop_page(wid, "zh", need_deps=True, need_desc=False)
+    return result.get("deps") if result.get("reason") == "ok" else None
 
 
 def _cache_dir(workshop_id: str) -> Path:
@@ -1251,9 +1543,9 @@ def fetch_workshop_preview(workshop_id: str, language: str = "zh", *,
     2026-11-03 重构 v3：纯同步秒出 + 异步后台 HTML desc 补全。
       - 缓存命中 → 直接返回（不管 title/desc 有没有中文），**毫秒级**
       - 缓存无效 → Web API 抓 title/desc/tags/preview_url → 落盘 → 返回（也是秒级）
-      - zh 界面 + desc 无中文 + html_checked 未标记 → 启动后台 daemon 线程爬 HTML 补中文
-        后台不阻塞当前返回，前端 _pollHtmlFill 每 5s 轮询自动刷新 desc
-      - desc 补中文才值得花 3s（长文本）；title 不补（就几个词）
+      - zh 界面 + 原文为外语（<15%）+ 本轮版本未试过 → 自动入队补一次中文描述，
+        不阻塞当前返回，前端 _pollHtmlFill 每 5s 轮询自动刷新 desc
+      - 双语（15%~30%）与已确认无中文的版本不自动抓，由手动入口触发
 
     返回值里带 `cached` 字段：True=命中缓存，False=首次抓取。
     """
@@ -1263,13 +1555,26 @@ def fetch_workshop_preview(workshop_id: str, language: str = "zh", *,
     cached = _load_cached(workshop_id, language)
     if cached is not None and _cache_valid(cached, language):
         # ── 缓存命中 → 直接返回（毫秒级）──
-        # 但 zh 界面 + desc 无中文 + 未爬过 HTML → 异步后台补
-        if (language == "zh" and not _skip_html
-                and not _has_chinese(cached.get("description") or "")
-                and not cached.get("html_checked")):
-            _launch_async_html_fill(workshop_id, language,
-                                    api_time_updated=int(cached.get("time_updated") or 0))
-            _log.debug("[workshop] wid=%s 缓存返回，后台线程补中文 desc", workshop_id)
+        # 原文为外语（<15%）且本轮版本还没试过社区页 → 自动入队补一次中文
+        desc_text = cached.get("description") or ""
+        if desc_text and (cached.get("desc_lang_v") != _DESC_LANG_VERSION
+                          or "zh_ratio" not in cached):
+            lang, ratio = _desc_language(desc_text)
+            cached["desc_lang"] = lang
+            cached["zh_ratio"] = round(ratio, 4)
+            cached["is_bilingual"] = _ZH_RATIO_WEAK <= ratio < _ZH_RATIO_ENOUGH
+            cached["desc_lang_v"] = _DESC_LANG_VERSION
+            cached.pop("_html_fetched", None)
+            _save_cache(workshop_id, cached, None, "image/jpeg")
+        # 原文为外语（<15%）且本轮版本还没试过社区页 → 入队补一次中文，不阻塞返回
+        if not _skip_html and _desc_needs_fetch(
+            workshop_id, language, int(cached.get("time_updated") or 0)
+        ):
+            ensure_html(
+                workshop_id, language,
+                api_time_updated=int(cached.get("time_updated") or 0),
+                reason="preview",
+            )
         cached.pop("_html_fetched", None)
         cached["cached"] = True
         return _convert_desc_to_html(cached)
@@ -1318,6 +1623,7 @@ def fetch_workshop_preview(workshop_id: str, language: str = "zh", *,
         "总订阅数": _fmt(api_item.get("lifetime_subscriptions")),
     }
 
+    desc_lang, desc_ratio = _desc_language(final_desc)
     result: dict = {
         "cache_version": _CACHE_VERSION,
         "workshop_id": workshop_id,
@@ -1332,6 +1638,11 @@ def fetch_workshop_preview(workshop_id: str, language: str = "zh", *,
         # 缓存里存 BBCode（Web API 返回的就是 BBCode）
         "description": final_desc or None,
         "desc_src": "api",
+        "desc_lang": desc_lang,
+        "zh_ratio": round(desc_ratio, 4),
+        "is_bilingual": _ZH_RATIO_WEAK <= desc_ratio < _ZH_RATIO_ENOUGH,
+        "desc_lang_v": _DESC_LANG_VERSION,
+        "no_translation": False,
         "author": None,
         "stats": stats,
         "url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={workshop_id}",
@@ -1340,10 +1651,15 @@ def fetch_workshop_preview(workshop_id: str, language: str = "zh", *,
 
     _save_cache(workshop_id, result, None, "image/jpeg")
 
-    # 后台线程异步补中文 desc（如果需要）
-    if (language == "zh" and not _skip_html
-            and not _has_chinese(final_desc)):
-        _launch_async_html_fill(workshop_id, language, api_time_updated=int(api_item.get("time_updated") or 0))
+    # 原文为外语（<15%）且本轮版本还没试过社区页 → 入队补一次中文，不阻塞返回
+    if not _skip_html and _desc_needs_fetch(
+        workshop_id, language, int(api_item.get("time_updated") or 0)
+    ):
+        ensure_html(
+            workshop_id, language,
+            api_time_updated=int(api_item.get("time_updated") or 0),
+            reason="preview",
+        )
 
     fresh = _load_cached(workshop_id, language)
     if fresh is not None:
