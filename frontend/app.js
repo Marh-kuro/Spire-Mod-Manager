@@ -1,4 +1,4 @@
-// ==========================================================================
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿// ==========================================================================
 // Spire Mod Manager — 前端 Vue3 应用
 // 版本号约定: 语义化 SEMVER（Alpha/Beta 阶段用 0.x.y，稳定后 1.0.0）
 //   MAJOR = 不兼容的 API/架构改动
@@ -67,6 +67,38 @@ const app = createApp({
     const _multiClear = () => { multiSelected.value = []; };
     // shift 多选的锚点（第一次点击的副本 version_key）
     const _rangeAnchorKey = ref(null);
+
+    // ====== 延迟保存：dirty flag ======
+    const hasUnsavedChanges = ref(false);
+    const markDirty = () => { hasUnsavedChanges.value = true; };
+    const clearDirty = () => { hasUnsavedChanges.value = false; };
+
+    // ====== 快照比对法：自动检测净变化 ======
+    let savedStateSnapshot = '';
+    const _snapshot = () => JSON.stringify({
+      en: state.enabled.map(m => m.id.toLowerCase()),  // 保留顺序，不 sort（sort 会让拖拽排序变化检测失效）
+      dis: state.disabled.map(m => m.id.toLowerCase()),
+    });
+    const updateSnapshot = () => {
+      savedStateSnapshot = _snapshot();
+      hasUnsavedChanges.value = false;
+      touchedKeys.clear();
+    };
+    const checkDirtyStatus = () => {
+      const cur = _snapshot();
+      if (cur === savedStateSnapshot) {
+        hasUnsavedChanges.value = false;
+        touchedKeys.clear();
+      } else {
+        hasUnsavedChanges.value = true;
+      }
+    };
+
+    // 2026-11-07 Step 3: 前端脏数据标记
+    // 三元组 [mod_id_lower, workshop_id_or_null, version_key]
+    // workshop_id 统一转 null（漏洞 3）
+    // Set 存 JSON string，save() 时反解成 just_touched_list 数组传给后端
+    const touchedKeys = new Set();
     const enabledSearch = ref('');
     const disabledSearch = ref('');
     // 界面语言（zh / en）与标签中英文对照表
@@ -90,7 +122,7 @@ const app = createApp({
       targetList: null,      // 光标当前在哪个列表（实时更新）
       fromIdx: -1,           // flat 数组起始索引（仅 enabled 内部排序用）
       targetIdx: -1,         // flat 数组目标索引（仅 enabled 内部排序用）
-      fromModId: null,       // 被拖 canonical id（用于 set_enabled / reorder_enabled）
+      fromModId: null,       // 被拖 canonical id（延迟保存架构后只改前端 state，不再提交后端 set_enabled / reorder_enabled）
       fromMod: null,         // 被拖 flat 副本对象（ghost 显示用）
       pointerX: 0,
       pointerY: 0,
@@ -98,6 +130,11 @@ const app = createApp({
       _pointerDownX: 0,
       _pointerDownY: 0,
       _hasMoved: false,
+    });
+
+    // 全局缓存：state.enabled/disabled 变动时才重新 expandModList（700+ 项拉平很贵）
+    const _cachedAllFlat = computed(() => {
+      return expandModList([...state.enabled, ...state.disabled]);
     });
 
     // 拖拽期间渲染数组：直接返回完整列表（不挤开任何元素）
@@ -146,7 +183,8 @@ const app = createApp({
     const packTab = ref('packs');
     const skin = reactive({ available: false, roles: [], config_found: false, manager: 'native' });
     const card = reactive({ available: false, roles: [], config_found: false, manager: 'native' });
-    const settings = reactive({ show: false, form: { manual_game_root: '', manual_mods_dirs: '', manual_workshop_dir: '', manual_mods_dir: '', manual_save_dir: '', language: 'zh', workshop_html_fill: true } });
+    const settings = reactive({ show: false, form: { manual_game_root: '', manual_mods_dirs: '', extra_mods_list: [], manual_workshop_dir: '', manual_mods_dir: '', manual_save_dir: '', language: 'zh', workshop_html_fill: true } });
+    const previewCollapse = reactive({ siblings: false, status: true });
     const settingsTab = ref('paths');
     // 工坊更新检查
     const workshopUpdates = reactive({ checking: false, checked: 0, errors: 0, updates: [], lastChecked: '' });
@@ -159,6 +197,8 @@ const app = createApp({
     const mpCompat = reactive({ checking: false, results: {}, stats: {}, lastChecked: '' });
     // 应用信息（关于页）
     const appInfo = reactive({ version: '' });
+    // 前端版本号（cache-busting 真源，由 index.html head 里的 __FE_VERSION__ 注入）
+    const feVer = window.__FE_VERSION__ || 'unknown';
     // DLL 分析进度（中下方进度条）
     const dllProgress = reactive({ show: false, current: '', done: 0, total: 0 });
     // 扫描进度（中下方进度条）
@@ -219,6 +259,8 @@ const app = createApp({
       const content = String(text == null ? '' : text);
       const kind = TOAST_DURATION[type] ? type : 'info';
       const key = opts.key || null;
+      // opts.duration 允许调用方自定义倒计时（进度条同步走完），未传则用类型默认时长
+      const dur = Number(opts.duration) > 0 ? Number(opts.duration) : null;
       const now = Date.now();
       for (const [k, ts] of toastRecent) {
         if (now - ts > 5000) toastRecent.delete(k);
@@ -231,8 +273,10 @@ const app = createApp({
           found.text = content;
           if (kind === 'error') found.type = 'error';
           else if (found.type !== 'error' && kind !== 'info') found.type = kind;
-          if (opts.sticky) _clearToastTimer(found.id);
-          else armToastTimer(found.id, TOAST_DURATION[found.type]);
+          if (opts.sticky) {
+            _clearToastTimer(found.id);
+            found.hasBar = false;   // sticky 开始提示不显示倒计时进度条
+          } else armToastTimer(found.id, dur || TOAST_DURATION[found.type]);
           return found.id;
         }
         // 手动关闭过的 key 不复活；错误升级除外
@@ -258,16 +302,55 @@ const app = createApp({
 
       while (toasts.length >= TOAST_MAX) _evictToastForRoom();
       const id = ++toastSeq;
-      toasts.push({ id, key, text: content, type: kind, mergeKey: opts.mergeKey || null, count: 1 });
+      toasts.push({ id, key, text: content, type: kind, mergeKey: opts.mergeKey || null, count: 1, hasBar: false, ratio: 1 });
       if (opts.sticky) _clearToastTimer(id);
-      else armToastTimer(id, TOAST_DURATION[kind]);
+      else armToastTimer(id, dur || TOAST_DURATION[kind]);
       return id;
     }
 
-    function armToastTimer(id, duration) {
+    function armToastTimer(id, duration, total) {
       _clearToastTimer(id);
-      const st = { started: Date.now(), remaining: duration, timer: setTimeout(() => dismissToast(id), duration) };
+      const st = { started: Date.now(), remaining: duration, duration: total || duration, timer: setTimeout(() => dismissToast(id), duration) };
       toastTimers.set(id, st);
+      const item = toasts.find(x => x.id === id);
+      if (item) {
+        item.hasBar = true;
+        // 不再写 item.ratio —— 进度条完全由 _refreshToastBars DOM 直写
+      }
+      // 初始拉满（100%）：直接 DOM 写，不等 rAF 首帧
+      requestAnimationFrame(() => {
+        const el = document.querySelector(`[data-toast-bar="${id}"]`);
+        if (el) el.style.width = '100%';
+      });
+      _startToastBarLoop();
+    }
+
+    // 进度条跟随倒计时：rAF 每帧直接写 DOM style.width —— 完全绕开 Vue 响应式
+    // 这样 5 个 toast 同时倒计时也不会触发模板重渲染，CSS transition 丝滑生效
+    // _refreshToastBars 返回 true 表示还有活跃 timer，rAF 继续循环；false 则退出
+    let toastBarRaf = null;
+    function _refreshToastBars() {
+      let anyActive = false;
+      const now = Date.now();
+      for (const item of toasts) {
+        const st = toastTimers.get(item.id);
+        if (!st || !st.timer) continue;
+        anyActive = true;
+        const pct = st.duration > 0
+          ? Math.max(0, st.remaining - (now - st.started)) / st.duration * 100
+          : 0;
+        const el = document.querySelector(`[data-toast-bar="${item.id}"]`);
+        if (el) el.style.width = pct + '%';
+      }
+      return anyActive;
+    }
+    function _startToastBarLoop() {
+      if (toastBarRaf) return;
+      const step = () => {
+        toastBarRaf = null;
+        if (_refreshToastBars()) toastBarRaf = requestAnimationFrame(step);
+      };
+      toastBarRaf = requestAnimationFrame(step);
     }
 
     function pauseToast(item) {
@@ -276,13 +359,20 @@ const app = createApp({
       clearTimeout(st.timer);
       st.timer = null;
       st.remaining = Math.max(0, st.remaining - (Date.now() - st.started));
+      // 立即 DOM 写冻结位置（_refreshToastBars 下帧会因 st.timer=null 跳过）
+      if (item) {
+        const pct = st.duration > 0 ? st.remaining / st.duration * 100 : 0;
+        const el = document.querySelector(`[data-toast-bar="${item.id}"]`);
+        if (el) el.style.width = pct + '%';
+      }
     }
 
     function resumeToast(item) {
       const st = item && toastTimers.get(item.id);
       if (!st) return;
       if (st.remaining <= 0) { dismissToast(item.id); return; }
-      armToastTimer(item.id, st.remaining);
+      // 带上原始总时长，进度条从当前比例继续而不是重新拉满
+      armToastTimer(item.id, st.remaining, st.duration);
     }
 
     function dismissToast(id, manual = false) {
@@ -492,9 +582,7 @@ const app = createApp({
 
     const filteredDisabled = computed(() => {
       const q = disabledSearch.value.trim().toLowerCase();
-      let list = q ? state.disabled.filter(m => matches(m, q)) : state.disabled;
-      // 停用列表默认按最近活动时间倒序（刚停的排最上）
-      return [...list].sort((a, b) => (b.last_activity || 0) - (a.last_activity || 0));
+      return q ? state.disabled.filter(m => matches(m, q)) : state.disabled;
     });
 
     function matches(m, q) {
@@ -527,6 +615,51 @@ const app = createApp({
       const tags = (selected.value.manager_tags || []).filter(Boolean);
       const src = selected.value.tag_source || "local";
       return tags.map(t => ({ tag: t, source: src }));
+    });
+
+    // ====== 同文件夹兄弟 mod 映射 ======
+    // 找路径中最后一个纯数字段（Workshop ID），parent 截到那一级（含）
+    // 例：.../content/2868840/3748583469/AliceDefectSkin → parent = .../2868840/3748583469
+    // 例：.../content/2868840/3747602295 (无子目录) → parent = .../2868840/3747602295（正确，RituLib 自己一个）
+    const _getParentDir = (path) => {
+      if (!path) return null;
+      const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+      if (parts.length < 3) return null;
+      // 找最后一个纯数字段（Workshop ID）
+      let lastNumIdx = -1;
+      for (let i = 0; i < parts.length; i++) {
+        if (/^\d+$/.test(parts[i])) lastNumIdx = i;
+      }
+      if (lastNumIdx < 0) return null;  // 没找到数字段（本地 mods/ 目录下）
+      // 如果数字段已经是最后一段（无子目录），parent 就截到那级（含）
+      // 如果数字段后面还有子目录，也截到那级（含）
+      return parts.slice(0, lastNumIdx + 1).join('/');
+    };
+    const siblingModsMap = computed(() => {
+      const map = {};
+      const all = [...state.enabled, ...state.disabled];
+      for (const m of all) {
+        const parent = _getParentDir(m.path);
+        if (!parent) continue;
+        if (!map[parent]) map[parent] = [];
+        map[parent].push(m);
+      }
+      return map;
+    });
+    const selectedSiblings = computed(() => {
+      const s = selected.value;
+      if (!s || !s.path) return [];
+      const parent = _getParentDir(s.path);
+      if (!parent) return [];
+      const all = siblingModsMap.value[parent] || [];
+      // 用 entryKey 过滤（不是 id）——同一物理副本才排除
+      const _ek = (m) => {
+        const wid = m && m.workshop_id ? String(m.workshop_id) : '';
+        const mid = (m && m.id || '').toLowerCase();
+        return wid + '|' + mid;
+      };
+      const myEk = _ek(s);
+      return all.filter(m => _ek(m) !== myEk);
     });
 
     // 命中的关键词（作为 tag 徽标直观展示）
@@ -668,7 +801,7 @@ const app = createApp({
       if (!m) return;
       translationBusy.value = true;
       try {
-        const r = await api().request_workshop_translation(m.id);
+        const r = await api().request_workshop_translation(m.id, m.workshop_id);
         if (!r || !r.ok) {
           showToast(t('translation_failed'), 'warning');
           return;
@@ -715,16 +848,33 @@ const app = createApp({
       return lines.join('\n');
     }
 
-    function depWarnTitle(m) {
-      if (!m || !m.dep_flags) return '';
-      const flagMap = {
-        missing_install: '依赖的 mod 未安装',
-        missing_enable: '依赖的 mod 未启用',
-        order_warn: '依赖顺序可能错误',
-        cycle: '检测到循环依赖',
-        dup_warn: '同一 mod_id 存在多个物理副本（游戏仅加载活动版本）',
-      };
-      return '依赖问题：\n' + m.dep_flags.map(f => '  • ' + (flagMap[f] || f)).join('\n');
+    function itemWarnTitle(m) {
+      if (!m) return '';
+      const redLines = [];
+      if (m.dep_flags && m.dep_flags.length) {
+        const flagMap = {
+          missing_install: '依赖的 mod 未安装',
+          missing_enable: '依赖的 mod 未启用',
+          order_warn: '依赖顺序可能错误',
+          cycle: '检测到循环依赖',
+          dup_warn: '同一 mod_id 存在多个物理副本（游戏仅加载活动版本）',
+        };
+        redLines.push('依赖问题：');
+        m.dep_flags.forEach(f => { if (flagMap[f]) redLines.push('  • ' + flagMap[f]); });
+      }
+      if (m.game_incompat) redLines.push('游戏版本不兼容：此 mod 要求的版本超出当前游戏版本范围');
+      if (m.has_dup_copies) redLines.push('同模组有多个副本同时启用（游戏可能只加载其中一个，请确认要保留哪个）');
+
+      const yellowLines = [];
+      if (m.is_bundle) {
+        yellowLines.push(t('bundle_warn_title', { n: m.bundle_size, names: (m.sibling_names || []).join('、') }));
+      } else if (m.has_siblings) {
+        yellowLines.push(t('sibling_warn_title', { names: (m.sibling_names || []).join('、') }));
+      }
+
+      if (redLines.length) return redLines.join('\n');
+      if (yellowLines.length) return yellowLines.join('\n');
+      return '';
     }
 
     function versionLabel(v) {
@@ -858,19 +1008,81 @@ const app = createApp({
     }
 
     function applyState(s) {
+      // 统一条目唯一键：workshop_id + mod_id
+      // 不能只按 mod_id 去重——不同 workshop 的 mod 可能共享同一个 manifest mod_id（Watcher bug）
+      // 本地 mod（无 workshop_id）退化成空串 + mod_id，等价于旧行为
+      const entryKey = (m) => {
+        const wid = m && m.workshop_id ? String(m.workshop_id) : '';
+        const mid = (m && m.id || '').toLowerCase();
+        return wid + '|' + mid;
+      };
       // 防御性去重：后端应该保证无重复，但前端加保险
-      // 多副本场景下如果 state.enabled/disabled 有同 id 重复 canonical，
-      // expandModList 会把每个 canonical 的 all_versions 都展开 → 翻倍
+      // 2026-11-05 改：按 entryKey 去重，兼容不同 workshop 同 mod_id 场景
       const _dedup = (arr) => {
         const seen = new Set();
         return (arr || []).filter(m => {
-          const id = (m.id || '').toLowerCase();
-          if (!id || seen.has(id)) return false;
-          seen.add(id); return true;
+          const k = entryKey(m);
+          if (!k || seen.has(k)) return false;
+          seen.add(k); return true;
         });
       };
-      state.enabled = _dedup(s.enabled);
-      state.disabled = _dedup(s.disabled);
+      // 2026-11-08：给每个 mod 挂 has_siblings（同文件夹兄弟）、game_incompat、is_bundle（合集）
+      const _tagMods = (arr) => {
+        // 找最后一个纯数字段（Workshop ID），parent 截到那级（含）
+        const _getParentDir2 = (path) => {
+          if (!path) return null;
+          const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+          if (parts.length < 3) return null;
+          let lastNumIdx = -1;
+          for (let i = 0; i < parts.length; i++) {
+            if (/^\d+$/.test(parts[i])) lastNumIdx = i;
+          }
+          if (lastNumIdx < 0) return null;
+          return parts.slice(0, lastNumIdx + 1).join('/');
+        };
+        const flat = [...(s.enabled || []), ...(s.disabled || [])];
+        // 同副本多启用检测：数每个 mod_id 有多少个启用的物理副本
+        const dupCountMap = {};
+        for (const f of flat) {
+          if (!f.is_enabled) continue;
+          const mid = (f.id || '').toLowerCase();
+          if (!mid) continue;
+          dupCountMap[mid] = (dupCountMap[mid] || 0) + 1;
+        }
+        // 构造 entryKey 过滤（同 entryKey = 同一个物理 mod，不算兄弟）
+        const _ek = (m) => {
+          const wid = m && m.workshop_id ? String(m.workshop_id) : '';
+          const mid = (m && m.id || '').toLowerCase();
+          return wid + '|' + mid;
+        };
+        const sibMap = {};
+        for (const m of flat) {
+          const p = _getParentDir2(m.path);
+          if (!p) continue;
+          if (!sibMap[p]) sibMap[p] = [];
+          sibMap[p].push(m);
+        }
+        for (const m of arr) {
+          const pp = _getParentDir2(m.path);
+          const sibs = pp && sibMap[pp] ? sibMap[pp] : [];
+          const myEk = _ek(m);
+          // 兄弟：排除自己（用 entryKey 对比，不是 id——不同物理副本可能同 id）
+          const realSibs = sibs.filter(x => _ek(x) !== myEk);
+          m.has_siblings = realSibs.length >= 1;  // 有至少 1 个真实兄弟就算
+          m.sibling_count = realSibs.length;
+          m.sibling_names = realSibs.map(x => x.name || x.id || '').filter(Boolean).slice(0, 5);
+          m.is_bundle = realSibs.length >= 3;  // ≥4 个物理 mod（自己+3 兄弟）判定为合集
+          m.bundle_size = realSibs.length + 1;
+          const vc = m.version_compat;
+          m.game_incompat = !!(vc && (vc.status === 'needs_update' || vc.status === 'too_new'));
+          m.has_dup_copies = !!dupCountMap[(m.id || '').toLowerCase()] && dupCountMap[(m.id || '').toLowerCase()] >= 2;
+        }
+        return arr;
+      };
+      // 全局挂载 entryKey，给后续所有 canonical 查找 / 排序用
+      window.__entryKey = entryKey;
+      state.enabled = _dedup(_tagMods(s.enabled || []));
+      state.disabled = _dedup(_tagMods(s.disabled || []));
       state.packs = s.packs || [];
       state.backups = s.backups || [];
       state.backup_stats = s.backup_stats || {};
@@ -904,16 +1116,18 @@ const app = createApp({
       // 后端返回的 mod 对象没有 dep_flags / has_dep_warning，
       // 必须在这里统一重算一次（含 dup_warn），否则所有依赖警告在后端回灌后丢失
       _localRecheckDeps();
+      // 历史状态：同 mod 多副本同时启用只提示，不自动改
+      _checkDuplicateEnabledCopies();
 
       // 选中保留：先按 __version_key（install_dir hash）精确匹配；
       // 找不到再按 id 找；还找不到 → 保留旧 selected（如果它仍在 state 里）。
       // 只有 selected 真被删了（不在新 enabled+disabled 里）才清掉。
-      const prevKey = selected.value ? selected.value.__version_key : null;
+      const prevKey = selected.value ? (selected.value.__row_key || selected.value.__version_key) : null;
       const prevId = selected.value ? selected.value.id : null;
       let newSelected = null;
       if (prevKey && prevId) {
         const allFlat = expandModList([...state.enabled, ...state.disabled]);
-        newSelected = allFlat.find(x => x.__version_key === prevKey);
+        newSelected = allFlat.find(x => x.__row_key === prevKey);
       }
       if (!newSelected && prevId) {
         // 也从 flat 副本找（确保有 __version_key）
@@ -934,6 +1148,7 @@ const app = createApp({
       _maybePollTitles(s.titles_pending);
       _maybePollBgProgress();
       _maybePollHtmlTasks();
+      updateSnapshot();  // 每次 applyState 后重建快照（含首次加载）
     }
 
     // ---------------------------------------------------------------- 标题补全轮询
@@ -972,8 +1187,8 @@ const app = createApp({
           bgProgress.phase1 = r.phase1 || bgProgress.phase1;
           bgProgress.phase2 = r.phase2 || bgProgress.phase2;
           bgProgress.running = !!r.running;
-          // show 条件：正在跑，或有明确进度差（done < total）
-          // 跑完（done >= total）且没在跑 → 瞬间隐藏，不留 30s
+          // show 条件：只认正在跑或有进度差（done < total）
+          // 之前加了 || p2Initialized 导致 phase2 初始化过一次后永不消失——永久开关 bug
           const p1Active = bgProgress.phase1.total >= 0 && bgProgress.phase1.done < bgProgress.phase1.total;
           const p2Active = bgProgress.phase2.total >= 0 && bgProgress.phase2.done < bgProgress.phase2.total;
           bgProgress.show = bgProgress.running || p1Active || p2Active;
@@ -1022,44 +1237,71 @@ const app = createApp({
       }, 3000);
     }
 
+    // 滚动到指定 flat 行（供保存后聚焦用）
+    function scrollToFlatRow(rowKey) {
+      if (!rowKey) return;
+      // 遍历所有 li 匹配 data-ver-key（避免 CSS.escape 对 Windows 反斜杠问题）
+      const allItems = document.querySelectorAll('li.mod-item, li.disabled-item');
+      let target = null;
+      for (const li of allItems) {
+        const vk = li.getAttribute('data-ver-key');
+        if (vk === rowKey) { target = li; break; }
+      }
+      if (!target) return;
+      requestAnimationFrame(() => {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
+
     function select(m, side, event) {
-      const vk = m.__version_key;
+      const rk = m.__row_key || m.__version_key;
       // Ctrl/Meta（Mac）点击：toggle 单个
       if (event && (event.ctrlKey || event.metaKey)) {
-        if (_multiHas(vk)) {
-          _multiDel(vk);
+        if (_multiHas(rk)) {
+          _multiDel(rk);
         } else {
-          _multiAdd(vk);
+          _multiAdd(rk);
         }
         selected.value = m;
-        _rangeAnchorKey.value = vk;
+        _rangeAnchorKey.value = { row_key: rk, side };
         nextTick(drawDeps);
         loadWorkshop(m);
         return;
       }
-      // Shift 点击：范围选择（从锚点到当前副本，限制在同 is_enabled 侧，不能跨启用/停用）
+      // Shift 点击：范围选择（按当前显示侧做范围，不合并两侧）
       if (event && event.shiftKey && _rangeAnchorKey.value) {
-        const allFlat = expandModList([...state.enabled, ...state.disabled]);
-        const anchorIdx = allFlat.findIndex(x => x.__version_key === _rangeAnchorKey.value);
-        const curIdx = allFlat.findIndex(x => x.__version_key === vk);
+        const anchor = _rangeAnchorKey.value;
+        // 锚点和当前侧不同 → 重置锚点为当前行，只选当前行
+        if (anchor.side !== side) {
+          _multiClear();
+          _rangeAnchorKey.value = { row_key: rk, side };
+          selected.value = m;
+          nextTick(drawDeps);
+          loadWorkshop(m);
+          return;
+        }
+        // 同侧：用 displayList 拿当前侧（含搜索过滤）的 flat 行做范围
+        const search = side === 'enabled' ? enabledSearch.value : disabledSearch.value;
+        const sideFlat = displayList(side === 'enabled' ? filteredEnabled.value : filteredDisabled.value, side, search);
+        const anchorIdx = sideFlat.findIndex(x => (x.__row_key || x.__version_key) === anchor.row_key);
+        const curIdx = sideFlat.findIndex(x => (x.__row_key || x.__version_key) === rk);
         if (anchorIdx >= 0 && curIdx >= 0) {
-          const anchorEnabled = allFlat[anchorIdx].is_enabled;
+          _multiClear();
           const [lo, hi] = anchorIdx < curIdx ? [anchorIdx, curIdx] : [curIdx, anchorIdx];
           for (let i = lo; i <= hi; i++) {
-            if (allFlat[i].is_enabled === anchorEnabled) {
-              _multiAdd(allFlat[i].__version_key);
-            }
+            _multiAdd(sideFlat[i].__row_key || sideFlat[i].__version_key);
           }
         }
         selected.value = m;
+        _rangeAnchorKey.value = { row_key: rk, side };
         nextTick(drawDeps);
         loadWorkshop(m);
         return;
       }
-      // 普通点击：清空多选 + 设置主选中
+      // 普通点击：清空多选 + 设置主选中 + 重置锚点
       _multiClear();
       selected.value = m;
-      _rangeAnchorKey.value = vk;
+      _rangeAnchorKey.value = { row_key: rk, side };
       nextTick(drawDeps);
       loadWorkshop(m);
     }
@@ -1128,15 +1370,24 @@ const app = createApp({
         });
       }
       if (bgProgress.show) {
+        // phase2（预览图下载）正在跑 → 优先显示；否则显示 phase1（工坊信息获取）
+        const p2 = bgProgress.phase2;
         const p1 = bgProgress.phase1;
-        const title = p1.total < 0 ? t('bg_fill_preparing') : (p1.running ? t('bg_fill_phase1') : t('bg_fill_done'));
+        const useP2 = (p2.total > 0 && (p2.running || (p2.done || 0) < (p2.total || 0))) ||
+                      (p2.running && p2.total < 0);
+        const p = useP2 ? p2 : p1;
+        // 文案：preparing=total<0，running，done
+        const title = p.total < 0
+          ? t('bg_fill_preparing')
+          : (p.running ? t(useP2 ? 'bg_fill_phase2' : 'bg_fill_phase1') : t('bg_fill_done'));
         cards.push({
           id: 'bg',
           title,
-          indeterminate: p1.total < 0,
-          done: Math.max(0, p1.done || 0),
-          total: Math.max(0, p1.total || 0),
-          fillClass: p1.total < 0 ? 'fill-purple' : 'fill-green',
+          // indeterminate 只在 total < 0（preparing）时晃；total <= 0 直接隐藏这个卡片
+          indeterminate: p.total < 0,
+          done: Math.max(0, p.done || 0),
+          total: Math.max(0, p.total || 0),
+          fillClass: p.total < 0 ? 'fill-purple' : 'fill-green',
         });
       }
       return cards.map(c => {
@@ -1147,7 +1398,7 @@ const app = createApp({
           ...c,
           indeterminate,
           percent: indeterminate ? 0 : Math.min(100, done / total * 100),
-          countText: indeterminate ? '' : `${Math.min(done, total)}/${total}`,
+          countText: indeterminate ? '' : `${Math.round(done / total * 100)}%`,
         };
       });
     });
@@ -1192,7 +1443,7 @@ const app = createApp({
       // 只有完全无缓存才显示进度条；已有缓存（无论完整/不完整）都秒开
       let cached = true;
       try {
-        cached = await api().is_workshop_cached(m.id);
+        cached = await api().is_workshop_cached(m.id, m.workshop_id);
       } catch (e) {
         cached = true;
       }
@@ -1200,7 +1451,7 @@ const app = createApp({
 
       workshop.loading = true;
       try {
-        const d = await api().get_workshop_details(m.id);
+        const d = await api().get_workshop_details(m.id, m.workshop_id);
         if (seq !== workshopSeq) { workshop.loading = false; return; }
         workshop.data = (d && d.workshop_id && !d.error) ? d : null;
         workshop.error = d && d.error ? d.error : '';
@@ -1224,50 +1475,60 @@ const app = createApp({
     function _pollHtmlFill(m, seq) {
       let ticks = 0;
       let busy = false;
+      let shownFetching = false;  // 开始提示只弹一次（带倒计时进度条），后续 tick 不重置
       const modName = (m && (m.name || m.title)) || '';
-      const toastKeyOf = () => {
-        const wid = workshop.data && workshop.data.workshop_id;
-        return wid ? 'html:' + wid : '';
-      };
+      // toast key 必须在轮询开始时固定：用户切换选中后 workshop.data 已换成新 mod，
+      // 动态取 wid 会 dismiss 错目标，旧 sticky Toast 就一直留在右上角不消失。
+      const pollWid = (m && m.workshop_id) || (workshop.data && workshop.data.workshop_id) || '';
+      const tk = pollWid ? 'html:' + pollWid : '';
       const token = ++translationPollToken;
       translationPolling.value = true;
-      const stop = (_tk) => {
+      const stop = (keepToast) => {
         if (token === translationPollToken) translationPolling.value = false;
-        if (_tk) dismissToastKey(_tk);
+        if (tk && !keepToast) dismissToastKey(tk);
         clearInterval(timer);
       };
       const tick = async () => {
         if (busy) return;
         busy = true;
-        const tk = toastKeyOf();
         try {
           ticks++;
-          if (seq !== workshopSeq) { stop(tk); return; }
-          if (ticks > 60) { stop(tk); return; }  // 5 分钟兜底
+          if (seq !== workshopSeq) { stop(); return; }
+          if (ticks > 60) { stop(); return; }  // 5 分钟兜底
           // 先看统一队列里该 wid 的状态，避免每 5s 重复拉完整详情
           const tasks = await api().get_html_tasks();
-          if (seq !== workshopSeq) { stop(tk); return; }
+          if (seq !== workshopSeq) { stop(); return; }
+          // 熔断感知：后端 HTML 熔断冷却中 → 直接停，不要永远 poll
+          if (tasks && tasks.circuit_open) {
+            console.warn('[pollHtmlFill] HTML 熔断开启，停止轮询并 dismiss toast');
+            stop();
+            return;
+          }
           const wid = workshop.data && workshop.data.workshop_id;
           const st = wid && tasks && tasks.items ? tasks.items[wid] : null;
           if (st && (st.status === 'queued' || st.status === 'running')) {
-            if (tk) showToast(t('preview_fetching', { name: modName }), 'info', { key: tk, sticky: true });
+            if (tk && !shownFetching) {
+              shownFetching = true;
+              // 抓取开始提示：3s 自动消失（走 TOAST_DURATION.info 默认值）
+              showToast(t('preview_fetching', { name: modName }), 'info', { key: tk });
+            }
             return;
           }
           if (st && st.status === 'failed') {
             if (tk) showToast(t('preview_fetch_failed', { name: modName }), 'warning', { key: tk });
-            stop(tk);
+            stop(true);  // 保留结果提示，让它按 4s 自动消失
             return;
           }
 
-          const d = await api().get_workshop_details(m.id);
-          if (seq !== workshopSeq) { stop(tk); return; }
+          const d = await api().get_workshop_details(m.id, m.workshop_id);
+          if (seq !== workshopSeq) { stop(); return; }
           if (d && d.html_desc_state === 'updated') {
             // 后台 HTML 补完 desc！刷新前端显示
             workshop.data = d;
             workshop.error = '';
             workshop.html_just_filled = true;
             if (tk) showToast(t('preview_fetched', { name: modName }), 'success', { key: tk });
-            stop(tk);
+            stop(true);  // 保留结果提示，让它按 3s 自动消失
             setTimeout(() => {
               if (seq === workshopSeq) workshop.html_just_filled = false;
             }, 3000);
@@ -1279,13 +1540,13 @@ const app = createApp({
                 ? 'preview_same_translation' : 'preview_no_translation';
               showToast(t(key, { name: modName }), 'info', { key: tk });
             }
-            stop(tk);
+            stop(true);  // 保留结果提示，让它按 3s 自动消失
           } else if (!st) {
             // 未入队且未检查过（例如开关关闭/退避中）→ 停止轮询
-            stop(tk);
+            stop();
           } else {
             // st 存在但既没 updated 也没 html_checked（理论上不该发生）→ 停止
-            stop(tk);
+            stop();
           }
         } catch (e) { /* 网络波动，下次再试 */ }
         finally { busy = false; }
@@ -1305,7 +1566,7 @@ const app = createApp({
     async function openWorkshop(mode) {
       wsMenu.show = false;
       if (!selected.value) return;
-      await api().open_workshop(selected.value.id, mode);
+      await api().open_workshop(selected.value.id, mode, selected.value.workshop_id);
     }
 
     /** 双击路由：所有副本统一启/停（活动/非活动副本选择逻辑已于 2026-10 删除） */
@@ -1319,44 +1580,142 @@ const app = createApp({
     // 多副本改由 source_states 多 source 独立启停；双击任何副本就是启停它自己
 
     async function toggle(m) {
-      // m 是 displayList 展开出来的 flat 副本
-      const canonical = state.enabled.find(x => x.id === m.id)
-                     || state.disabled.find(x => x.id === m.id);
-      if (!canonical) return;
-
-      // 用 version_key（= install_dir 路径）精确找到用户点的物理副本
-      // 这是唯一的精确定位方式，因为 norm_mod_source 无法区分 local vs disabled
-      const targetKey = m.__version_key;
-
-      // 精确获取当前副本的启停状态：从 all_versions 里找同 __version_key 的副本
-      let curCopyEnabled = m.is_enabled;  // flat 副本已经带了后端返回的 is_enabled
-      const enable = !curCopyEnabled;
-
+      // ====== 2026-11-06 架构重构：纯前端改 state，0 延迟 ======
+      const enable = !m.is_enabled;
       try {
-        _localRecheckDeps();
-        // workshop 副本和 local 副本用不同 toast——workshop 是改 save 文件（工坊状态），local 是搬目录
-        const isWs = !!m.workshop_id;
-        const toastKey = enable
-          ? (isWs ? 'enabled_toast_workshop' : 'enabled_toast')
-          : (isWs ? 'disabled_toast_workshop' : 'disabled_toast');
-        showToast(t(toastKey, { name: canonical.name }), 'success');
-
-        // 2026-10 关键：传 version_key 精确操作物理副本
-        const s = await api().set_enabled(canonical.id, enable, null, targetKey);
-        applyState(s);
-        _localRecheckDeps();
-        // 2026-11-05: toggle 不经过 select()，必须手动清空多选
-        console.log('[DEBUG toggle after apply] multiSelected before clear=', JSON.stringify(multiSelected.value));
+        _toggleFrontend(m, enable);
+        _localRecheckDeps();  // 操作后重算依赖警告
         _multiClear();
         // 选中保持当前点击的副本
         const flatAfter = expandModList([...state.enabled, ...state.disabled]);
-        const findM = flatAfter.find(x => x.__version_key === targetKey);
-        selected.value = findM || canonical;
-      } catch (err) {
-        console.error('[toggle] 失败:', err);
-        showToast('操作失败: ' + (err.message || err), 'error');
-        api().get_state().then(s => applyState(s)).catch(() => {});
+        const findM = flatAfter.find(x => x.__row_key === m.__row_key);
+        if (findM) selected.value = findM;
+        nextTick(drawDeps);
+        loadWorkshop(m);
+      } catch (e) {
+        console.error('[toggle] 前端操作失败:', e);
       }
+    }
+
+    /** 纯前端启停副本（延迟保存架构核心）。
+     *
+     * state.enabled/disabled 存 canonical 对象（带 all_versions 副本数组）。
+     * displayList 合并两侧 → 展开 all_versions → 按 flat 副本的 is_enabled 过滤分侧。
+     * 所以正确做法是改 canonical.all_versions 里对应副本的 is_enabled，
+     * 然后维护 canonical 在 enabled/disabled 数组的归属（影响启用侧排序）。
+     */
+    // 历史状态提示去重键：同 mod 多副本同时启用的组合不变时不重复弹
+    let _dupCopyWarnKey = '';
+
+    /** 同 mod 副本检测：启用侧是否已有同一 mod_id 的其它副本（含工坊/本地副本） */
+    function _findSameModEnabled(flatM, vk) {
+      const mid = (flatM.id || '').toLowerCase();
+      if (!mid) return null;
+      const selfKey = flatM.__row_key || (mid + '@' + vk);
+      const allFlat = expandModList([...state.enabled, ...state.disabled]);
+      return allFlat.find(f =>
+        !!f.is_enabled &&
+        f.__row_key !== selfKey &&
+        (f.id || '').toLowerCase() === mid
+      ) || null;
+    }
+
+    /** refresh 后检测：已有多个同 mod_id 副本同时启用（只提示，不改状态） */
+    function _checkDuplicateEnabledCopies() {
+      const allFlat = expandModList([...state.enabled, ...state.disabled]);
+      const countById = new Map();
+      for (const f of allFlat) {
+        if (!f.is_enabled) continue;
+        const mid = (f.id || '').toLowerCase();
+        if (!mid) continue;
+        countById.set(mid, (countById.get(mid) || 0) + 1);
+      }
+      const dups = [...countById.entries()].filter(([, n]) => n > 1);
+      const sig = dups.map(([mid, n]) => mid + ':' + n).sort().join('|');
+      if (sig && sig !== _dupCopyWarnKey) {
+        showToast(t('duplicate_copies_enabled_warning', { n: dups.length }), 'warning');
+      }
+      _dupCopyWarnKey = sig;
+    }
+
+    function _toggleFrontend(flatM, enable, opts) {
+      opts = opts || {};
+      const wasEnabled = !!flatM.is_enabled;
+      const _thisRoundKeys = new Set();
+      const vk = flatM.__version_key;
+      const mid = flatM.id;
+
+      // 1. 找到 canonical（可能在 enabled 或 disabled）
+      // canonical 级别一个 mod_id 一条，用纯 mod_id 匹配即可；
+      // 再靠 vIdx 精确定位 all_versions 里的目标副本
+      const midLow = (mid || '').toLowerCase();
+      let arr = state.enabled;
+      let sideIdx = arr.findIndex(c => (c.id || '').toLowerCase() === midLow);
+      if (sideIdx < 0) {
+        arr = state.disabled;
+        sideIdx = arr.findIndex(c => (c.id || '').toLowerCase() === midLow);
+      }
+      if (sideIdx < 0) { console.warn('[toggleFrontend] canonical not found id=' + mid); return; }
+      const canonical = arr[sideIdx];
+
+      // 2. 改 all_versions 里对应副本的 is_enabled
+      const vIdx = canonical.all_versions.findIndex(v => v.key === vk);
+      if (vIdx < 0) {
+        console.warn('[toggleFrontend] version not found vk=' + vk);
+        console.warn('[toggleFrontend] available keys:', canonical.all_versions.map(v => v.key && v.key.slice ? v.key.slice(-40) : v.key));
+        return;
+      }
+      // 同 mod 副本检测已删除（2026-11-09 需求反转：副本是独立模组，允许同时启用）
+      // 警告检测保留在 applyState 后的 _checkDuplicateEnabledCopies() 里
+      canonical.all_versions[vIdx].is_enabled = enable;
+      // 2026-11-07 Step 1: 同步写 enabled_at / disabled_at（前端本地显示用）
+      // 2026-11-07 Step 2 清理：batch_seq 彻底删，换后端微秒差
+      const _nowTs = Date.now() / 1000;
+      canonical.all_versions[vIdx].last_toggled_at = _nowTs;
+      if (enable) {
+        canonical.all_versions[vIdx].enabled_at = _nowTs;
+      } else {
+        canonical.all_versions[vIdx].disabled_at = _nowTs;
+      }
+      // 2026-11-07 Step 3: 前端脏数据标记（漏洞 3: workshop_id 统一转 null）
+      const _wid = flatM.workshop_id || null;
+      const _k1 = JSON.stringify([midLow, _wid, vk]);
+      touchedKeys.add(_k1); _thisRoundKeys.add(_k1);
+
+      // 互斥逻辑已删除（2026-11-09 需求反转：local/disabled 副本启用不再被动停其他副本）
+
+      // 4. 维护 canonical 在 state.enabled / disabled 的归属
+      const hasAnyEnabled = canonical.all_versions.some(v => v.is_enabled);
+      const isInEnabled = arr === state.enabled;
+      if (hasAnyEnabled && !isInEnabled) {
+        // 从 disabled 移到 enabled —— 自动排序（按依赖链）
+        arr.splice(sideIdx, 1);
+        if (opts.insertAt !== undefined) {
+          state.enabled.splice(Math.min(opts.insertAt, state.enabled.length), 0, canonical);
+        } else {
+          // 插入式排序：让 canonical 插到正确的依赖链位置
+          // _localInsertNewlyEnabled 返回一个新数组，需整体替换 state.enabled 保持响应式
+          const sorted = _localInsertNewlyEnabled(canonical, state.enabled);
+          state.enabled.splice(0, state.enabled.length, ...sorted);
+        }
+      } else if (!hasAnyEnabled && isInEnabled) {
+        arr.splice(sideIdx, 1);
+        state.disabled.push(canonical);  // 追加到末尾（不破坏 disabled_order 手动顺序）
+      } else {
+      }
+      checkDirtyStatus();
+      // 工坊 mod 前端启用即拉依赖（不等扫描/保存），用户视角“启用就算成功”
+      if (enable && flatM.workshop_id && !(canonical.dependencies || []).length) {
+        _fetchWorkshopDeps(mid);
+      }
+      // 同步后端内存状态（只改内存不写盘，微秒级，fire-and-forget）
+      try { api().apply_frontend_delta(
+        state.enabled.map(c => c.id),
+        state.disabled.map(c => c.id),
+        { version_key: flatM.__version_key, mod_id: flatM.id,
+          workshop_id: flatM.workshop_id || null, is_enabled: !!enable }
+      ); } catch(e) { console.warn('[toggleFrontend] apply_frontend_delta 失败', e); }
+      return true;
     }
 
     /** 乐观版插入式排序：新启用 mod 插到依赖链正确位置 */
@@ -1383,6 +1742,26 @@ const app = createApp({
       else if (maxParentIdx >= 0) insertAt = maxParentIdx + 1;
       arr.splice(insertAt, 0, newMod);
       return arr;
+    }
+
+    /** 前端启用工坊 mod 时立即拉依赖：只回填该 mod 的 dependencies，不整包 applyState（避免覆盖并发 toggle） */
+    const _depsFetching = new Set();
+    const _wsDepsCache = new Map();  // 工坊 API 拉取的依赖缓存（modId → deps[]），applyState 后回填用
+    function _fetchWorkshopDeps(modId) {
+      const key = String(modId || '').toLowerCase();
+      if (!key || _depsFetching.has(key)) return;
+      _depsFetching.add(key);
+      try {
+        Promise.resolve(api().fetch_mod_deps(modId)).then(res => {
+          _depsFetching.delete(key);
+          if (!res || !res.ok || !Array.isArray(res.deps) || res.deps.length === 0) return;
+          const target = [...state.enabled, ...state.disabled]
+            .find(m => (m.id || '').toLowerCase() === key);
+          if (!target) return;
+          target.dependencies = res.deps;
+          _localRecheckDeps();
+        }).catch(e => { _depsFetching.delete(key); console.debug('[deps] 启用拉取失败', e); });
+      } catch (e) { _depsFetching.delete(key); console.debug('[deps] 调用失败', e); }
     }
 
     /** 乐观版依赖检查：重算所有 mod（启用 + 停用）的 has_dep_warning / dep_flags / missing_deps
@@ -1416,17 +1795,25 @@ const app = createApp({
       allMods.forEach(m => {
         const flags = [];
         const missingDeps = [];
+        // 预览面板直接渲染 dep_statuses，后端只在刷新时才重算 → 前端启停后必须同步重算，
+        // 否则前置已启用但预览仍显示「未启用」。
+        const depStatuses = [];
         const myId = (m.id || '').toLowerCase();
         const myIdx = enabledIdx[myId];  // 停用 mod 是 undefined
         const deps = m.dependencies || [];
         const isEnabled = myIdx !== undefined;
 
-        // 停用 mod 不加载，依赖警告无意义 → 直接清零跳过
+        // 停用 mod 也要算 depStatuses（预览固定显示依赖），
+        // 但 has_dep_warning/dep_flags/missing_deps 只对启用 mod 有意义 → 给 false/空
         if (!isEnabled) {
+          // 源头清理：停用侧所有警告标志强制清空（这些只对启用侧有意义）
           m.has_dep_warning = false;
           m.dep_flags = [];
           m.missing_deps = [];
-          return;
+          m.has_dup_copies = false;
+          m.game_incompat = false;
+          m.has_siblings = false;
+          return;  // forEach 里用 return 跳过当前迭代
         }
 
         for (const depRaw of deps) {
@@ -1438,16 +1825,19 @@ const app = createApp({
           for (const e of enabledIds) { if (e === depId || e.startsWith(depId + '#') || depId.startsWith(e + '#')) { matchedEnabled = e; break; } }
 
           if (matchedAll === null) {
-            flags.push('missing_install');
-            missingDeps.push(depId);
+            if (isEnabled) { flags.push('missing_install'); missingDeps.push(depId); }
+            depStatuses.push({ id: String(depRaw), status: 'missing_install' });
           } else if (matchedEnabled === null) {
-            flags.push('missing_enable');
-            missingDeps.push(matchedAll);
-          } else if (isEnabled) {
+            if (isEnabled) { flags.push('missing_enable'); missingDeps.push(matchedAll); }
+            depStatuses.push({ id: String(depRaw), status: 'missing_enable' });
+          } else {
+            depStatuses.push({ id: String(depRaw), status: 'ok' });
             // 顺序检查只对启用 mod 有意义；反向也依赖我 = 双向引用，不算顺序错误
-            const depIdx = enabledIdx[matchedEnabled];
-            if (depIdx !== undefined && depIdx > myIdx && !enabledDepEdges.has(matchedEnabled + '>' + myId)) {
-              flags.push('order_warn');
+            if (isEnabled) {
+              const depIdx = enabledIdx[matchedEnabled];
+              if (depIdx !== undefined && depIdx > myIdx && !enabledDepEdges.has(matchedEnabled + '>' + myId)) {
+                flags.push('order_warn');
+              }
             }
           }
         }
@@ -1464,9 +1854,17 @@ const app = createApp({
 
         // dup_warn 是「提醒」而非「依赖错误」：不计入 has_dep_warning（不触发红色警告样式 / ⚠ 徽章），
         // 仅保留在 dep_flags 里供黄色提醒渲染（.dup-warn 边框 / dup-warn-panel）
-        m.has_dep_warning = flags.some(f => f !== 'dup_warn');
-        m.dep_flags = flags;
-        m.missing_deps = missingDeps;
+        if (isEnabled) {
+          m.has_dep_warning = flags.some(f => f !== 'dup_warn');
+          m.dep_flags = flags;
+          m.missing_deps = missingDeps;
+        }
+        // dep_statuses 每次都写（预览固定显示依赖状态）
+        if (Array.isArray(m.dep_statuses)) {
+          m.dep_statuses.splice(0, m.dep_statuses.length, ...depStatuses);
+        } else {
+          m.dep_statuses = depStatuses;
+        }
       });
     }
 
@@ -1559,11 +1957,124 @@ const app = createApp({
     }
 
     async function save() {
-      const r = await api().save_all();
-      if (r && r.ok) {
-        showToast(t('save_done'), 'success');
-      } else {
-        showToast((r && r.errors && r.errors.join('; ')) || '保存失败', 'error');
+      // ====== 延迟保存架构：commit_changes 原子化提交 ======
+      try {
+        const enabledIds = state.enabled.map(m => m.id);
+        const disabledIds = state.disabled.map(m => m.id);
+        // 副本级明细：同 mod_id 多个工坊/本地副本时，canonical 无法表达
+        // 「只启用其中一个副本」，必须把每个副本的 is_enabled 一起提交
+        const copyStates = [];
+        for (const side of ['enabled', 'disabled']) {
+          for (const m of state[side]) {
+            if (m.__ph || !Array.isArray(m.all_versions)) continue;
+            for (const v of m.all_versions) {
+              // 只提交显式设置过 is_enabled 的副本；undefined 跳过
+              // 绝对不能用 side fallback → 跨源副本会被错误标记（Baselib 联动根因）
+              if (v.is_enabled === undefined || v.is_enabled === null) continue;
+              copyStates.push({
+                version_key: v.key,
+                mod_id: m.id,
+                workshop_id: v.workshop_id || null,
+                enabled: !!v.is_enabled,
+              });
+            }
+          }
+        }
+        // 2026-11-07 Step 3: 反解 touchedKeys → just_touched_list
+        // 按 disabledIds 顺序排序（微秒差倒序用：越前的 touched 副本微秒差越大 → 排越上）
+        const touchedArr = [];
+        for (const jsonKey of touchedKeys) {
+          try {
+            const triple = JSON.parse(jsonKey);
+            touchedArr.push({
+              mod_id: triple[0],       // lower
+              workshop_id: triple[1], // null 或 wid 字符串
+              version_key: triple[2],
+            });
+          } catch (e) { /* 忽略格式错的 */ }
+        }
+        // 排序：按 disabledIds 顺序（没在 disabled 的排最后）
+        const _disIdx = Object.fromEntries(disabledIds.map((id, i) => [id.toLowerCase(), i]));
+        const _enIdx = Object.fromEntries(enabledIds.map((id, i) => [id.toLowerCase(), i]));
+        touchedArr.sort((a, b) => {
+          const ai = a.mod_id in _disIdx ? _disIdx[a.mod_id] : 99999 + (a.mod_id in _enIdx ? _enIdx[a.mod_id] : 199999);
+          const bi = b.mod_id in _disIdx ? _disIdx[b.mod_id] : 99999 + (b.mod_id in _enIdx ? _enIdx[b.mod_id] : 199999);
+          return ai - bi;
+        });
+
+        const r = await api().commit_changes(enabledIds, disabledIds, copyStates, touchedArr);
+        if (r && r.ok) {
+          clearDirty();
+          // no_op：没有实际物理操作（什么都没改）
+          if (r.no_op) {
+            showToast('保存成功（无变更）', 'info');
+            return;
+          }
+          // 后端物理层可能扫到了不同结构（搬目录后 install_dir 变了），re-sync 一次
+          const s = await api().get_state();
+          applyState(s);
+
+          const st = r.stats || {};
+          const totalSucc = (st.enabled_success || 0) + (st.disabled_success || 0);
+          const totalFail = (st.enabled_fail || 0) + (st.disabled_fail || 0);
+
+          // Toast：统一简化文案，不弹具体模组名（用户不想看细节）
+          // 有任何类型的警告（同副本/缺依赖/版本/同文件夹）或保存有失败 → 统一提示
+          // hasWarnings 只扫启用侧 —— 停用侧警告已在 _localRecheckDeps 源头清空，
+          // 加 m.is_enabled 双重保险（防止未来有人加新警告标志忘了源头清）
+          const hasWarnings = _cachedAllFlat.value.some(m => m.is_enabled &&
+            (m.has_dep_warning || m.game_incompat || m.has_siblings || m.has_dup_copies));
+
+          if (totalFail === 0 && !hasWarnings) {
+            showToast('保存成功', 'success');
+          } else {
+            let msg = '保存成功';
+            if (totalFail > 0) msg += `，部分模组未生效（可能文件被占用）`;
+            if (hasWarnings) msg += '，已定位相关模组';
+            showToast(msg, totalFail > 0 ? 'warning' : 'success');
+          }
+
+          // 聚焦：从 flat 行实际展示顺序（从上到下）找第一个有问题的
+          setTimeout(() => {
+            // 先从保存失败的模组里找（用户最关心）
+            let targetRow = null;
+            if (totalFail > 0) {
+              const firstFail = (st.fail_details || [])[0];
+              if (firstFail) {
+                targetRow = _cachedAllFlat.value.find(m =>
+                  (m.id || '').toLowerCase() === (firstFail.mod || '').toLowerCase());
+              }
+            }
+            // 没有失败 → 找第一个有警告的（只扫启用侧！停用侧的 has_dup_copies / game_incompat 没被清）
+            if (!targetRow) {
+              targetRow = _cachedAllFlat.value.find(m => m.is_enabled &&
+                (m.has_dep_warning || m.game_incompat || m.has_siblings || m.has_dup_copies));
+            }
+            if (targetRow) {
+              select(targetRow);
+              // scrollToFlatRow 匹配的是 li 上的 data-ver-key（= __version_key），
+              // 不能传 __row_key（= modid@version_key）——格式不匹配永远找不到
+              const rk = targetRow.__version_key || targetRow.__row_key;
+              scrollToFlatRow(rk);
+            }
+          }, 400);
+        } else {
+          // ok=false：后端返回了 errors（全失败，所有 attempted 操作都失败）
+          // 检查是不是 WinError 32 / Permission denied（文件被游戏占用）
+          const errs = (r && r.errors) || [];
+          const isFileLock = errs.some(e =>
+            (e.error || '').includes('32') ||
+            (e.error || '').includes('WinError') ||
+            (e.error || '').toLowerCase().includes('permission') ||
+            (e.error || '').includes('文件被占用'));
+          if (isFileLock) {
+            showToast('保存失败：文件被占用，请关闭游戏后重试', 'error');
+          } else {
+            showToast('保存失败，请重试', 'error');
+          }
+        }
+      } catch (e) {
+        showToast('保存异常: ' + (e.message || e), 'error');
       }
     }
 
@@ -1733,7 +2244,7 @@ const app = createApp({
     }
 
     async function backupAll(scope) {
-      if (scope === 'all' && !confirm(t('confirm_backup_all'))) return;
+      if (scope === 'all' && !confirm(t('confirm_backup_all', { n: state.enabled.length + state.disabled.length }))) return;
       backupBusy.show = true;
       backupBusy.mode = 'indeterminate';
       backupBusy.done = 0;
@@ -1900,38 +2411,36 @@ const app = createApp({
       }
     }
 
-    async function clearEnabled() {
-      if (!state.enabled.length) { alert(t('empty_enabled')); return; }
-      if (!confirm(t('confirm_clear_enabled', { n: state.enabled.length }))) return;
-      const s = await api().clear_enabled();
-      applyState(s);
+    function clearEnabled() {
+      // ====== 纯前端：确认后把所有 canonical 所有副本 is_enabled 改成 false + 移到 disabled ======
+      const allCanonicals = [...state.enabled, ...state.disabled];
+      // 只读扫描：有没有任何启用的副本
+      let hadAny = false;
+      for (const c of allCanonicals) {
+        for (const v of c.all_versions) {
+          if (v.is_enabled) { hadAny = true; break; }
+        }
+        if (hadAny) break;
+      }
+      if (!hadAny) { alert(t('empty_enabled')); return; }
+      if (!confirm(t('confirm_clear_enabled'))) return;
+      // 确认后才写：副本 is_enabled 置 false
+      for (const c of allCanonicals) {
+        for (const v of c.all_versions) {
+          v.is_enabled = false;
+          v.last_toggled_at = Date.now() / 1000;
+        }
+      }
+      // 原子归属：所有 canonical 移到 disabled
+      state.disabled.push(...state.enabled.splice(0, state.enabled.length));
+      checkDirtyStatus();
       showToast(t('cleared_enabled'), 'success');
     }
 
-    // 2026-11-05 批量启停：遍历 multiSelected 逐个调精确 set_enabled
-    async function batchSetEnabled(enable) {
-      const count = multiSelected.value.length;
-      if (!count) { showToast(t('no_multi_selected'), 'warning'); return; }
-      const verb = enable ? t('batch_enable_verb') : t('batch_disable_verb');
-      if (!confirm(t('confirm_batch_enable', { verb, n: count }))) return;
-      const allFlat = expandModList([...state.enabled, ...state.disabled]);
-      const targets = allFlat.filter(m => _multiHas(m.__version_key) && !m.workshop_id);
-      let ok = 0, fail = 0;
-      for (const m of targets) {
-        try {
-          const r = await api().set_enabled(m.id, enable, m.__version_key);
-          if (r.ok) ok++; else fail++;
-        } catch (e) { fail++; }
-      }
-      // 最后 applyState 一次（只在循环结束后）
-      const lastState = await api().get_state();
-      applyState(lastState);
-      _multiClear();
-      if (fail === 0) {
-        showToast(t('batch_done_all', { verb, n: ok }), 'success');
-      } else {
-        showToast(t('batch_done_partial', { verb, ok, fail }), 'warning');
-      }
+    // 2026-11-06 批量启停：纯前端，循环 _toggleFrontend。批量启用最后统一互斥收口。
+    function _reconcileFrontendMutualExclusion() {
+      // 2026-11-09 需求反转：副本是独立模组，不再互斥停其他副本
+      // 此函数清空保留（调用点 L3113 还在，改成空操作避免调用点报错）
     }
 
     // ------------------------------------------------------------------ 游戏版本 & Beta 分支
@@ -2067,6 +2576,10 @@ const app = createApp({
     }
 
     async function launch() {
+      // 延迟保存兜底：有未保存变更时先自动 commit，确保游戏读到最新 settings.save
+      if (hasUnsavedChanges.value) {
+        await save();
+      }
       const force = false;
       launchState.value = 'launching';
       await api().launch_game(force);
@@ -2102,7 +2615,7 @@ const app = createApp({
 
     // P1: 自实现拖拽 —— Pointer Events + 占位符驱动列表实时挤开
     // 思路: pointerdown 记录起始 → pointermove 算目标 idx 实时改 dragDisplay（Vue 重渲 → flex 自动挤开）
-    //  → pointerup 提交后端 set_enabled / reorder_enabled → applyState
+    //  → pointerup 直接改前端 state.enabled 数组顺序 + markDirty（延迟保存架构，不调 set_enabled / reorder_enabled）
     let _cleanupFns = [];  // onPointerMove/onPointerUp 引用（需动态移除）
 
     function _getListEl(which) {
@@ -2168,7 +2681,7 @@ const app = createApp({
       drag.targetList = whichList; // 初始默认 = 起始列表
       drag.fromIdx = idx;       // flat 数组起始索引（仅 enabled 内部排序用）
       drag.targetIdx = idx;     // flat 数组目标索引（仅 enabled 内部排序用）
-      drag.fromModId = m.id;    // canonical id（用于 set_enabled / reorder_enabled）
+      drag.fromModId = m.id;    // canonical id（延迟保存架构后只改前端 state，不再调 set_enabled / reorder_enabled）
       drag.fromMod = m;
       drag.pointerX = e.clientX;
       drag.pointerY = e.clientY;
@@ -2286,58 +2799,33 @@ const app = createApp({
       }
 
       if (fromList === 'disabled' && targetList === 'enabled') {
-        // —— A) 启用 + 插到 placeholder 位置 ——
-        const enabledArr = [...state.enabled];
-        let insertCid = null; // 插到哪个 canonical 前面（或后面追加）
+        // —— A) 启用 + 插到 placeholder 位置（纯前端，0 延迟）——
+        let insertFlatItem = null;
         if (toFlat >= 0) {
           const flatList = displayList(filteredEnabled.value, 'enabled', enabledSearch.value);
           const insertAt = Math.max(0, Math.min(toFlat, flatList.length));
-          // 找 placeholder 右侧（被插入位置）的真实 canonical
           for (let i = insertAt; i < flatList.length; i++) {
-            if (flatList[i] && !flatList[i].__ph) { insertCid = flatList[i].id; break; }
+            if (flatList[i] && !flatList[i].__ph) { insertFlatItem = flatList[i]; break; }
           }
         }
         let targetCanonicalIdx;
-        if (insertCid) {
-          targetCanonicalIdx = enabledArr.findIndex(c => c.id === insertCid);
+        if (insertFlatItem) {
+          const targetMid = (insertFlatItem.id || '').toLowerCase();
+          targetCanonicalIdx = state.enabled.findIndex(c => (c.id || '').toLowerCase() === targetMid);
         } else {
-          targetCanonicalIdx = enabledArr.length; // 追加到末尾
+          targetCanonicalIdx = state.enabled.length;
         }
-        // 后端：先启用再重排（必须传 version_key 精确操作物理副本）
-        await api().set_enabled(fromModId, true, null, fromMod.__version_key);
-        const newState = await api().get_state();
-        applyState(newState);
-        // applyState 后从新的 state.enabled 里找到刚启用的 mod
-        const freshEnabled = [...state.enabled];
-        const justEnabledIdx = freshEnabled.findIndex(c => c.id === fromModId);
-        // workshop 副本和 local 副本用不同 toast
-        const dragIsWs = !!fromMod.workshop_id;
-        const dragEnableKey = dragIsWs ? 'enabled_toast_workshop' : 'enabled_toast';
-        const dragDisableKey = dragIsWs ? 'disabled_toast_workshop' : 'disabled_toast';
-        if (justEnabledIdx >= 0 && justEnabledIdx !== targetCanonicalIdx) {
-          const moved = freshEnabled.splice(justEnabledIdx, 1)[0];
-          let finalTo = targetCanonicalIdx;
-          if (justEnabledIdx < targetCanonicalIdx) finalTo--;
-          finalTo = Math.max(0, Math.min(finalTo, freshEnabled.length));
-          freshEnabled.splice(finalTo, 0, moved);
-          state.enabled = freshEnabled;
-          await api().reorder_enabled(freshEnabled.map(m => m.id));
-          _localRecheckDeps();
-          showToast(t(dragEnableKey, { name: fromMod?.name || fromModId }), 'success');
-        } else {
-          showToast(t(dragEnableKey, { name: fromMod?.name || fromModId }), 'success');
-        }
+        // 用 _toggleFrontend 改副本 is_enabled，并指定 insertAt 插入 canonical 到 enabled
+        _toggleFrontend(fromMod, true, { insertAt: targetCanonicalIdx });
+        _localRecheckDeps();
+        nextTick(drawDeps);
         return;
       }
 
       if (fromList === 'enabled' && targetList === 'disabled') {
-        // —— B) 停用（必须传 version_key 精确操作物理副本）——
-        const dragIsWs = !!fromMod.workshop_id;
-        const dragDisableKey = dragIsWs ? 'disabled_toast_workshop' : 'disabled_toast';
-        await api().set_enabled(fromModId, false, null, fromMod.__version_key);
-        const newState = await api().get_state();
-        applyState(newState);
-        showToast(t(dragDisableKey, { name: fromMod?.name || fromModId }), 'success');
+        // —— B) 停用（纯前端，0 延迟）——
+        _toggleFrontend(fromMod, false);
+        nextTick(drawDeps);
         return;
       }
 
@@ -2350,30 +2838,41 @@ const app = createApp({
       if (fromFlat < 0 || toFlat < 0) return;
       if (fromFlat === toFlat) return;
 
+      // _ek2 保留：L2649-2655 的 flat↔flat 比较还要用它区分同 mod_id 不同副本
+      const _ek2 = window.__entryKey || (m => (m.workshop_id ? String(m.workshop_id) : '') + '|' + (m.id || '').toLowerCase());
       const enabledArr = [...state.enabled];
-      const fromCanonicalIdx = enabledArr.findIndex(c => c.id === fromModId);
+      // canonical↔flat 比较用纯 mod_id（canonical 级别一个 mod_id 一条）
+      const fromMid = (fromMod.id || '').toLowerCase();
+      const fromCanonicalIdx = enabledArr.findIndex(c => (c.id || '').toLowerCase() === fromMid);
       if (fromCanonicalIdx < 0) return;
 
       const flatList = displayList(filteredEnabled.value, 'enabled', enabledSearch.value);
       const insertAt = Math.max(0, Math.min(toFlat, flatList.length));
 
-      let leftCid = null;
-      let rightCid = null;
+      let leftFlat = null;
+      let rightFlat = null;
       for (let i = insertAt - 1; i >= 0; i--) {
-        if (flatList[i] && !flatList[i].__ph) { leftCid = flatList[i].id; break; }
+        if (flatList[i] && !flatList[i].__ph) { leftFlat = flatList[i]; break; }
       }
       for (let i = insertAt; i < flatList.length; i++) {
-        if (flatList[i] && !flatList[i].__ph) { rightCid = flatList[i].id; break; }
+        if (flatList[i] && !flatList[i].__ph) { rightFlat = flatList[i]; break; }
       }
 
-      if (leftCid === fromModId && rightCid === fromModId) return;
-      if (leftCid === rightCid && leftCid !== null) return;
+      // flat↔flat 用 entryKey（同 mod_id 多副本要按 wid 区分）
+      const fromEk = _ek2(fromMod);
+      const leftEk = leftFlat ? _ek2(leftFlat) : null;
+      const rightEk = rightFlat ? _ek2(rightFlat) : null;
+      if (leftEk === fromEk && rightEk === fromEk) return;
+      if (leftEk === rightEk && leftEk !== null) return;
 
+      // canonical↔flat 用纯 mod_id（canonical 级别唯一）
       let toCanonicalIdx;
-      if (rightCid) {
-        toCanonicalIdx = enabledArr.findIndex(c => c.id === rightCid);
-      } else if (leftCid) {
-        const leftIdx = enabledArr.findIndex(c => c.id === leftCid);
+      if (rightFlat) {
+        const rightMid = (rightFlat.id || '').toLowerCase();
+        toCanonicalIdx = enabledArr.findIndex(c => (c.id || '').toLowerCase() === rightMid);
+      } else if (leftFlat) {
+        const leftMid = (leftFlat.id || '').toLowerCase();
+        const leftIdx = enabledArr.findIndex(c => (c.id || '').toLowerCase() === leftMid);
         toCanonicalIdx = leftIdx + 1;
       } else {
         toCanonicalIdx = 0;
@@ -2395,10 +2894,10 @@ const app = createApp({
       state.enabled = enabledArr;
       _localRecheckDeps();
 
-      if (selected.value && fromMod && fromMod.__version_key === selected.value.__version_key) {
+      if (selected.value && fromMod && fromMod.__row_key === selected.value.__row_key) {
         requestAnimationFrame(() => {
           const newList = displayList(filteredEnabled.value, 'enabled', enabledSearch.value);
-          const found = newList.find(x => x.__version_key === fromMod.__version_key);
+          const found = newList.find(x => x.__row_key === fromMod.__row_key);
           if (found) selected.value = found;
         });
       }
@@ -2406,14 +2905,8 @@ const app = createApp({
       if (enabledSearch.value.trim()) {
         showToast('已在当前搜索范围内重排', 'success');
       }
-
-      api().reorder_enabled(enabledArr.map(m => m.id)).then(() => {
-        api().get_state().then(s => applyState(s)).catch(() => {});
-      }).catch(err => {
-        console.error('[drag] reorder failed:', err);
-        showToast('排序保存失败，请检查后端日志', 'error');
-        api().get_state().then(s => applyState(s)).catch(() => {});
-      });
+      // 延迟保存架构：排序只改前端 state.enabled 数组，commit_changes 统一同步
+      checkDirtyStatus();
     }
 
     async function openMenu(e, m) {
@@ -2465,15 +2958,21 @@ const app = createApp({
           ? m.all_versions
           : [{ key: m.id + '-default', version: m.version, source: m.source, source_label: m.source_label, workshop_id: m.workshop_id, path: null, is_enabled: (m.is_enabled !== undefined ? m.is_enabled : true) }];
         for (const v of versions) {
-          // 防御性去重：如果 canonical 有重复，versions 也会被重复展开
-          if (seenKeys.has(v.key)) continue;
-          seenKeys.add(v.key);
+          // 去重必须按「mod_id + 物理 key」：工坊合集同一个 install_dir 下有多个
+          // 不同 mod_id 的 manifest，只用 v.key 会把兄弟 mod 全部合并成一条，
+          // 表现为双击停用后「又出现一条」，要再双击才能停掉下一个。
+          const rk = (m.id || '').toLowerCase() + '@' + v.key;
+          if (seenKeys.has(rk)) continue;
+          seenKeys.add(rk);
           result.push({
             ...m,
             // 2026-11-01：每个副本独立显示名（workshop title > mod.json name）
             // 同 mod_id 多 workshop 副本（如圣主历险记原版 vs 修复版）各自显示 Steam 上的真实标题
             name: v.name || m.name,
             __version_key: v.key,
+            // 工坊合集：同一 install_dir 下可能有多个 manifest（不同 mod_id），
+            // __version_key 会重复；UI 身份用 mod_id + 物理 key 保证一条一个唯一 key
+            __row_key: rk,
             source: v.source,
             // 关键：覆盖 external_source！flat 副本可能是本地副本，
             // 不能继承 canonical 的 external_source="steam"（工坊）
@@ -2486,6 +2985,13 @@ const app = createApp({
             is_enabled: (v.is_enabled !== undefined) ? v.is_enabled : m.is_enabled,
             // 该副本最近一次 toggle 时间戳（后端 _source_last_toggled 下发）
             last_toggled_at: v.last_toggled_at || 0,
+            // 分开的启停时间（后端 2026-11-06 Step 2 新增）
+            enabled_at: v.enabled_at || 0,
+            disabled_at: v.disabled_at || 0,
+            // 2026-11-07: batch_seq 彻底删
+            // 2026-11-07 Step 1: scanner 固化的文件系统时间（排序链兜底）
+            mtime: v.mtime || 0,
+            ctime: v.ctime || 0,
           });
         }
       }
@@ -2496,8 +3002,8 @@ const app = createApp({
     // side 为 'disabled' 时返回 is_enabled=false 的副本
     // 内部处理搜索过滤（flat 副本级别）
     function displayList(rawList, side /* 'enabled' | 'disabled' */, searchQuery) {
-      // 合并两侧 canonical 全部拉平
-      const allFlat = expandModList([...state.enabled, ...state.disabled]);
+      // 用全局缓存（state.enabled/disabled 变动时 computed 自动失效重建）
+      const allFlat = _cachedAllFlat.value;
       const targetEnabled = (side === 'enabled');
       let filtered = allFlat.filter(f => !!f.is_enabled === targetEnabled);
       // 搜索过滤（flat 副本级别，匹配 id/name/author）
@@ -2509,29 +3015,41 @@ const app = createApp({
           return hay.includes(q);
         });
       }
-      // 启用侧：保持 canonical 在 state.enabled 的顺序（load order 有意义）
+      // 统一：按 canonical 在对应侧 state 数组里的顺序排
+      // state.enabled/disabled 是 canonical 粒度（一个 mod_id 一条），所以用纯 modid_lower 匹配
+      // （不能用 wid|modid 因为 canonical 对象的 wid 可能是 null，而 flat 行有具体 wid）
+      const _mid = (m) => (m.id || '').toLowerCase();
+      const _stableSub = (a, b) => {
+        // 同 canonical 下多副本：按 install_dir（__version_key 的尾部）稳定排序
+        const ak = a.__version_key || '';
+        const bk = b.__version_key || '';
+        if (ak === bk) return 0;
+        return ak < bk ? -1 : 1;
+      };
       if (side === 'enabled') {
-        const order = state.enabled.map(m => m.id.toLowerCase());
+        const order = state.enabled.map(_mid);
         filtered.sort((a, b) => {
-          const ai = order.indexOf(a.id.toLowerCase());
-          const bi = order.indexOf(b.id.toLowerCase());
-          if (ai === -1 && bi === -1) return 0;
+          const ai = order.indexOf(_mid(a));
+          const bi = order.indexOf(_mid(b));
+          if (ai === -1 && bi === -1) return _stableSub(a, b);
           if (ai === -1) return 1;
           if (bi === -1) return -1;
-          return ai - bi;
+          if (ai !== bi) return ai - bi;
+          return _stableSub(a, b);
         });
       } else {
-        // 停用侧：按 last_toggled_at 倒序（从新到旧）
-        // ts > 0 = 本次 GUI 会话刚 toggle 过（刚停的）→ 排前面
-        // ts = 0 = settings.save 加载的初始状态（早停的）→ 保持原始位置不动
-        // 关键：ts 相等时返回 0 让稳定排序保持 filtered 原始顺序
-        //       这样 ts=0 的 flat 副本保持它们在 settings.save 里的顺序
-        //       同 canonical 的两个 flat 因为 ts 不同（一个刚停 ts>0，一个早停 ts=0）→ 自然分开
+        // disabled 侧三级排序：disabled_at 倒序 → state.disabled index → __version_key 兜底
+        // 最新停用的飞第一，多选批量停用按 canonical 顺序平移，同 mod_id 副本各排各的
+        const indexMap = new Map();
+        state.disabled.forEach((m, idx) => indexMap.set((m.id || '').toLowerCase(), idx));
         filtered.sort((a, b) => {
-          const ta = a.last_toggled_at || 0;
-          const tb = b.last_toggled_at || 0;
-          if (tb !== ta) return tb - ta;
-          return 0;  // 稳定排序：保持 filtered 原始顺序
+          const ta = a.disabled_at || 0;
+          const tb = b.disabled_at || 0;
+          if (ta !== tb) return tb - ta;                         // 第一关：时间大的（最近停用）排前面
+          const ia = indexMap.get((a.id || '').toLowerCase()) ?? 999999;
+          const ib = indexMap.get((b.id || '').toLowerCase()) ?? 999999;
+          if (ia !== ib) return ia - ib;                         // 第二关：时间相同（多选批量停）→ 按 state.disabled 尺码
+          return String(a.__version_key).localeCompare(String(b.__version_key));  // 第三关：同 canonical 多副本 → 按物理路径兜底
         });
       }
       return filtered;
@@ -2560,38 +3078,62 @@ const app = createApp({
       setTimeout(flash, 300);
     }
 
-    async function menuToggle() {
+    function menuToggle() {
       menu.show = false;
       if (multiSelectedCount.value > 1) {
-        // 多选批量模式：只对本地副本生效，跳过 workshop（和后端 store_mods.py 批量模式一致）
+        // 多选批量模式：包含工坊副本（单副本启停本来就支持工坊）
         const targetEnable = !menu.mod.is_enabled;
         const allFlat = expandModList([...state.enabled, ...state.disabled]);
-        const targets = allFlat.filter(m => _multiHas(m.__version_key) && !m.workshop_id);
+        const targets = allFlat.filter(m => _multiHas(m.__row_key));
         let okCount = 0;
-        for (const m of targets) {
-          try {
-            await api().set_enabled(m.id, targetEnable, null, m.__version_key);
+        if (targetEnable) {
+          // 批量启用：副本独立，不再互斥拦截
+          for (const m of targets) {
+            if (m.is_enabled === targetEnable) continue;
+            _toggleFrontend(m, targetEnable, { suppressDupToast: true });
             okCount++;
-          } catch (err) {
-            console.warn('[menuToggle batch] 单个失败:', m.id, err);
           }
+        } else {
+          // 批量停用：绕开 toggleFrontend，手写纯净逻辑避免 unshift 反转
+          const touchedCanonicals = new Set();
+          for (const m of targets) {
+            if (m.is_enabled === targetEnable) continue;
+            const midLow = (m.id || '').toLowerCase();
+            const canonical = state.enabled.find(c => (c.id || '').toLowerCase() === midLow);
+            if (!canonical) continue;
+            const vIdx = canonical.all_versions.findIndex(v => v.key === m.__version_key);
+            if (vIdx < 0) continue;
+            canonical.all_versions[vIdx].is_enabled = false;
+            const _now = Date.now() / 1000;
+            canonical.all_versions[vIdx].disabled_at = _now;
+            canonical.all_versions[vIdx].last_toggled_at = _now;
+            const _wid = m.workshop_id || null;
+            touchedKeys.add(JSON.stringify([midLow, _wid, m.__version_key]));
+            touchedCanonicals.add(canonical);
+            okCount++;
+          }
+          const movedCanonicals = state.enabled.filter(c =>
+            touchedCanonicals.has(c) && !c.all_versions.some(v => v.is_enabled)
+          );
+          state.enabled = state.enabled.filter(c => !movedCanonicals.includes(c));
+          state.disabled = [...state.disabled, ...movedCanonicals];
+          checkDirtyStatus();
+          try { api().apply_frontend_delta(
+            state.enabled.map(c => c.id),
+            state.disabled.map(c => c.id), null
+          ); } catch(e) { console.warn('[menuToggleDisable] apply_frontend_delta 失败', e); }
         }
-        const s = await api().get_state();
-        applyState(s);
+        if (targetEnable) _reconcileFrontendMutualExclusion(); // 空操作，保留调用点
         _multiClear();
+        _localRecheckDeps();
         const verb = targetEnable ? t('batch_enable') : t('batch_disable');
-        showToast(`${verb}: ${okCount}/${targets.length}`, okCount === targets.length ? 'success' : 'warning');
+        showToast(`${verb}: ${okCount}/${targets.length}`, 'success');
       } else {
-        // 单副本模式（原逻辑）
+        // 单副本模式
         const m = menu.mod;
         const enable = !m.is_enabled;
-        const s = await api().set_enabled(m.id, enable, null, m.__version_key);
-        applyState(s);
-        const isWs = !!m.workshop_id;
-        const toastKey = enable
-          ? (isWs ? 'enabled_toast_workshop' : 'enabled_toast')
-          : (isWs ? 'disabled_toast_workshop' : 'disabled_toast');
-        showToast(t(toastKey, { name: m.name || m.id }), 'success');
+        _toggleFrontend(m, enable);
+        _localRecheckDeps();
       }
     }
 
@@ -2600,11 +3142,11 @@ const app = createApp({
       menu.show = false;
       if (!m || !m.workshop_id) return;
       try {
-        const r = await api().refresh_workshop_preview(m.id);
+        const r = await api().refresh_workshop_preview(m.id, m.workshop_id);
         if (r && r.ok) {
           // 后端已删完两层缓存并立刻重抓了一次。无论当前选中没选中这个 mod，
           // 都主动触发右侧预览面板刷新——让用户立刻看到新数据。
-          const d = await api().get_workshop_details(m.id);
+          const d = await api().get_workshop_details(m.id, m.workshop_id);
           workshop.data = (d && d.workshop_id && !d.error) ? d : null;
           workshop.error = d && d.error ? d.error : '';
           // 同时全量刷新一次 state，确保列表里的标题/标签也同步更新
@@ -2631,7 +3173,7 @@ const app = createApp({
     async function openFolder() {
       const m = menu.mod;
       menu.show = false;
-      await api().open_folder(m.id, m.install_path || null);
+      await api().open_folder(m.id, m.path || null);
     }
 
     async function deleteMod() {
@@ -2709,6 +3251,7 @@ const app = createApp({
       settings.form = {
         manual_game_root: s.manual_game_root || '',
         manual_mods_dirs: s.manual_mods_dirs || '',
+        extra_mods_list: (s.manual_mods_dirs || '').split(/[;|]/).map(x => x.trim()).filter(Boolean),
         manual_workshop_dir: s.manual_workshop_dir || '',
         manual_mods_dir: s.manual_mods_dir || '',
         manual_save_dir: s.manual_save_dir || '',
@@ -3006,9 +3549,10 @@ const app = createApp({
     function closeTagDiag() { tagDiag.show = false; }
 
     async function saveSettings() {
+      const extraStr = (settings.form.extra_mods_list || []).map(x => (x || '').trim()).filter(Boolean).join(';');
       const s = await api().set_settings(
         settings.form.manual_game_root || null,
-        settings.form.manual_mods_dirs || null,
+        extraStr || null,
         settings.form.manual_workshop_dir || null,
         settings.form.manual_mods_dir || null,
         settings.form.manual_save_dir || null,
@@ -3022,7 +3566,18 @@ const app = createApp({
 
     async function pickFolder(field) {
       const r = await api().pick_folder();
-      if (r && r.path) settings.form[field] = r.path;
+      if (!r || !r.path) return;
+      // 支持数组索引格式：'extra_mods_list[0]'
+      const arrMatch = field.match(/^([a-zA-Z_][\w.]*)\[(\d+)\]$/);
+      if (arrMatch) {
+        const arrName = arrMatch[1];
+        const idx = parseInt(arrMatch[2], 10);
+        if (Array.isArray(settings.form[arrName])) {
+          settings.form[arrName].splice(idx, 1, r.path);
+          return;
+        }
+      }
+      settings.form[field] = r.path;
     }
 
     async function detectPaths() {
@@ -3093,7 +3648,7 @@ const app = createApp({
       if (!list.length) { depLayer.value.innerHTML = ''; return; }
       // 只有当 selected 实际在启用列表（flat）里时才用来高亮依赖线
       // __version_key 是物理副本唯一标识，跨侧不会误匹配
-      const selId = (selected.value && list.some(x => x.__version_key === selected.value.__version_key))
+      const selId = (selected.value && list.some(x => x.__row_key === selected.value.__row_key))
         ? selected.value.id : null;
       const groups = computeGroups(list, selId);
       const nodeX = DEP_AREA;
@@ -3154,6 +3709,7 @@ const app = createApp({
         if (refreshed) return;
         refreshed = true;
         loadLanguageSettings();
+        loadAppInfo();
         refreshGameVersion().then(() => {
           // 如果 Steam 正在下载，自动开始轮询（比如上次切换后下载还没完）
           api().get_app_update_status().then(s => {
@@ -3178,14 +3734,34 @@ const app = createApp({
     // 临时诊断：return 之前确认 _relTime 存在
     console.log('[DIAG] setup() about to return, _relTime exists:', typeof _relTime, 'DEP_AREA:', typeof DEP_AREA);
 
+    // ====== 延迟保存：beforeunload 拦截 ======
+    // 关闭应用时如有未保存变更，弹浏览器原生确认框
+    // 注意：Electron/Tauri WebView2 支持 beforeunload，退出进程时的原生退出不触发
+    window.addEventListener('beforeunload', (e) => {
+      if (hasUnsavedChanges.value) {
+        e.preventDefault();
+        e.returnValue = t('unsaved_changes_warn');
+        return e.returnValue;
+      }
+    });
+
+    // 格式化时间戳为本地时间字符串（调试/状态信息面板用）
+    const fmtTs = (ts) => {
+      if (!ts || ts <= 0) return '';
+      const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+
     return {
-      state, breakdown: computed(() => state.breakdown), selected, multiSelected, multiSelectedCount, batchSetEnabled, enabledSearch, disabledSearch, launchText, depLayer, depHeight, depStyle,
+      state, breakdown: computed(() => state.breakdown), selected, multiSelected, multiSelectedCount, hasUnsavedChanges, enabledSearch, disabledSearch, launchText, depLayer, depHeight, depStyle,
       menuEl, packMenuEl,
       toasts, pauseToast, resumeToast, dismissToast, dllProgress, bulkProgress, scanProgress,
-      filteredEnabled, filteredDisabled, selectedMeta, selectedDesc, selectedLocalTags, selectedManagerTags, selectedTagHits, selectedTags,
+      filteredEnabled, filteredDisabled, selectedMeta, selectedDesc, selectedLocalTags, selectedManagerTags, selectedTagHits, selectedTags, selectedSiblings,
       canFetchTranslation, translationHint, translationBusy, fetchCommunityTranslation,
       effectiveDescription, effectivePreview, effectiveTitle, effectiveAuthor,
-      subText, tooltip, depWarnTitle, versionLabel,
+      subText, tooltip, itemWarnTitle, versionLabel,
+      previewCollapse, fmtTs,
       workshop, wsMenu, openWsMenu, closeWsMenu, openWorkshop, bgProgress, currentProgressCard, progressTaskCount,
       refresh, select, toggle, autoSort, save, clearEnabled, launch, scan, copyText, doExport, togglePin,
       packMenu, openPackMenu, closePackMenu, sharePack, renamePack, deletePack, loadPack,
@@ -3199,7 +3775,7 @@ const app = createApp({
       onDepScroll, drag, dragRenderList, indicatorStyle,
       expandModList, displayList, dupCount,
       openSettings, closeSettings, saveSettings, pickFolder, detectPaths, closeWindow, menu, settings,
-      settingsTab, workshopUpdates, appInfo, checkWorkshopUpdates, replacementSuggestions, replacementChecking, findReplacementMods, steamdbExport, exportSteamdb, mpCompat, checkMpCompatibility, setMpOverride, mpStatusLabel, clearWorkshopCache, clearWorkshopCacheAll, clearDllCache, analyzeDlls, openWorkshopItem,
+      settingsTab, workshopUpdates, appInfo, feVer, checkWorkshopUpdates, replacementSuggestions, replacementChecking, findReplacementMods, steamdbExport, exportSteamdb, mpCompat, checkMpCompatibility, setMpOverride, mpStatusLabel, clearWorkshopCache, clearWorkshopCacheAll, clearDllCache, analyzeDlls, openWorkshopItem,
       logDiag, openLogDiag, closeLogDiag, loadGameLog,
       tagDiag, filteredTagDiag, openTagDiag, closeTagDiag,
       lang, tr, t,

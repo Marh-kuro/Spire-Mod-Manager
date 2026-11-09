@@ -134,66 +134,19 @@ body {
   margin-left: 8px;
 }
 
-/* mod 版本兼容徽章 */
-.version-compat-badge {
-  display: inline-block;
+/* 顶栏版本号徽章（后端 vX.X.X · 前端 YYYYMMDDx） */
+.topbar-ver {
   font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #1f2937;
+  color: #9ca3af;
+  border: 1px solid #374151;
   white-space: nowrap;
+  font-family: 'Consolas', 'Menlo', monospace;
+  margin-left: 4px;
+  cursor: default;
 }
-
-.version-compat-badge.ok {
-  background: #dcfce7;
-  color: #166534;
-}
-
-.version-compat-badge.needs_update {
-  background: #fee2e2;
-  color: #991b1b;
-}
-
-.version-compat-badge.too_new {
-  background: #fef3c7;
-  color: #92400e;
-}
-
-.version-compat-badge.unknown {
-  background: #f3f4f6;
-  color: #6b7280;
-}
-
-/* mod 预览区版本兼容面板 */
-.version-compat-panel.needs_update {
-  border-left: 3px solid #dc2626;
-  background: #fef2f2;
-}
-
-.version-compat-panel.too_new {
-  border-left: 3px solid #d97706;
-  background: #fffbeb;
-}
-
-.version-compat-detail {
-  font-size: 12px;
-  color: #4b5563;
-  margin-top: 4px;
-}
-
-.version-compat-info {
-  font-size: 12px;
-  color: #6b7280;
-  padding: 4px 0;
-  border-bottom: 1px dashed #e5e7eb;
-  margin-bottom: 4px;
-}
-
-.version-compat-info.ok .vc-icon { color: #16a34a; }
-.version-compat-info.unknown .vc-icon { color: #9ca3af; }
-
-.vc-min { font-weight: 600; }
-.vc-current { color: #9ca3af; }
 
 /* ===== 存档管理 Modal ===== */
 .saves-modal { min-width: 560px; max-width: 720px; max-height: 85vh; }
@@ -259,6 +212,14 @@ body {
 .bk-name { flex: 1; font-family: Consolas, monospace; color: #374151; }
 .bk-meta { color: #9ca3af; font-size: 11px; }
 
+/* 列表数字序号 */
+.seq-num {
+  color: #9ca3af;
+  font-size: 11px;
+  margin-right: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ===== 按钮 ===== */
 .btn {
   background: var(--card-title-bg);
@@ -266,9 +227,13 @@ body {
   border: 1px solid var(--card-border);
   border-radius: 6px;
   padding: 6px 12px;
+  min-width: 80px;
   font-weight: bold;
   cursor: pointer;
   font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .btn:hover {
@@ -301,7 +266,14 @@ body {
 }
 
 .btn-icon {
-  padding: 6px 10px;
+  padding: 6px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-save {
+  min-width: 110px;
 }
 
 /* ===== 四栏主布局（flex 水平排列）===== */
@@ -386,6 +358,8 @@ body {
 
 /* P0: Steam ID 显示 */
 .steam-id-badge {
+  flex-shrink: 0;
+  max-width: 100px;
   display: inline-block;
   padding: 4px 10px;
   font-size: 11px;
@@ -394,6 +368,9 @@ body {
   border: 1px solid rgba(74, 144, 226, 0.4);
   border-radius: 6px;
   letter-spacing: 0.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* P1: Pinned Mod 角标 */
@@ -547,6 +524,72 @@ body {
   padding: 8px 10px;
   margin-bottom: 8px;
 }
+
+/* ====== 同文件夹兄弟 mod 提示 ====== */
+.sibling-block {
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.sibling-title {
+  font-size: 12px;
+  font-weight: bold;
+  color: #a8873a;
+  margin-bottom: 4px;
+}
+.sibling-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+/* 状态信息面板：key-value 列表 */
+.preview-status-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.status-row {
+  display: flex;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.status-k {
+  color: #8c8c8c;
+  flex-shrink: 0;
+  width: 70px;
+}
+.status-v {
+  color: #333;
+  flex: 1;
+  word-break: break-all;
+}
+.status-path {
+  color: #8c8c8c;
+  font-size: 10px;
+  margin-left: 4px;
+}
+.mono {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 10px;
+  background: #f5f5f5;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.sibling-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: #fff7cc;
+  border: 1px solid #ffe066;
+  border-radius: 10px;
+  color: #7a5a00;
+  cursor: default;
+}
+.sibling-side {
+  opacity: 0.6;
+}
 .dep-block-title {
   font-size: 12px;
   font-weight: bold;
@@ -568,13 +611,9 @@ body {
 .dep-icon {
   font-size: 11px;
 }
-.dep-row.missing_install .dep-name,
-.dep-row.missing_enable .dep-name {
-  color: #dc2626;
-  font-weight: bold;
-}
-.dep-row.ok .dep-name {
-  color: #16a34a;
+/* dep-name 统一普通灰，状态颜色靠图标 🟢🟡🔴 表达 */
+.dep-name {
+  color: #334155;
 }
 .dep-label {
   color: #64748b;
@@ -718,6 +757,8 @@ body {
   margin-top: 0;
   color: #4a4a4a;
   line-height: 1.5;
+  word-wrap: break-word;
+  word-break: break-all;
   font-size: 12px;
 }
 
@@ -986,6 +1027,27 @@ body {
 }
 .btn-batch:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* ====== 延迟保存 dirty 态 ====== */
+.btn-dirty {
+  background: #e67e22 !important;  /* 橙色警示 */
+  color: #fff !important;
+  animation: dirtyPulse 2s infinite;
+}
+.dirty-mark {
+  margin-left: 2px;
+  font-weight: bold;
+}
+.unsaved-hint {
+  font-size: 11px;
+  color: #e67e22;
+  margin-left: 4px;
+  font-weight: 500;
+}
+@keyframes dirtyPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(230, 126, 34, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(230, 126, 34, 0); }
+}
+
 /* 刚启用的脉冲高亮特效 */
 @keyframes pulseHighlight {
   0%   { box-shadow: 0 0 0 0 rgba(52, 152, 219, 0.7); background: rgba(52, 152, 219, 0.25); }
@@ -1013,15 +1075,42 @@ body {
 
 /* ===== 依赖警告标红 ===== */
 .mod-item.warn-item {
-  border-left: 3px solid #ef4444;
-  background: #fef2f2;
-}
-.mod-item.warn-item:hover {
-  background: #fee2e2;
+  border: 2px solid #ef4444;
 }
 .mod-item.warn-item.selected {
-  background: #fecaca;
-  border-left-color: #dc2626;
+  border-color: #dc2626;
+}
+
+/* ===== 同副本（重复物理）橙色提醒 ===== */
+.mod-item.dup-warn {
+  border: 2px solid #e68a00;
+}
+.mod-item.dup-warn.selected {
+  border-color: #b36b00;
+}
+
+/* ===== 同文件夹兄弟 mod（2-3 mod）黄色描边 + 黄图标 ===== */
+.mod-item.yellow-folder {
+  border: 2px solid #fbbf24;
+}
+.mod-item.yellow-folder.selected {
+  border-color: #d97706;
+}
+/* 黄色图标覆盖（同文件夹兄弟） */
+.item-warn-icon.yellow-icon { color: #f59e0b; background: rgba(245,158,11,0.15); }
+.item-warn-icon.yellow-icon:hover { background: rgba(245,158,11,0.28); }
+
+/* ===== 合集徽章（只在列表项 mod 名后面显示，不做描边） ===== */
+.bundle-badge {
+  display: inline-block;
+  font-size: 10px;
+  background: #8b5cf6;
+  color: white;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: 4px;
+  vertical-align: middle;
 }
 .warn-badge-inline {
   display: inline-block;
@@ -1084,6 +1173,12 @@ body {
   background: #f39c12;
   color: #000;
 }
+/* 未订阅黄标（比 steam 稍亮，视觉区分） */
+.source-badge.src-unsub {
+  background: #f1c40f;
+  color: #000;
+  margin-left: 4px;
+}
 /* 本地来源蓝色（扫描路径 source=local / 物理搬停用后仍是本地） */
 .source-badge.src-local {
   background: #3498db;
@@ -1127,11 +1222,7 @@ body {
   text-overflow: ellipsis;
 }
 
-.dup-warn {
-  border-left: 3px solid #e68a00;
-}
-
-/* 启用列表 + 依赖线 */
+/* ===== 启用列表 + 依赖线 ===== */
 .enabled-list-wrap {
   position: relative;
   flex: 1;
@@ -1452,6 +1543,7 @@ body {
 
 .btn-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 6px;
 }
@@ -1461,11 +1553,15 @@ body {
 }
 
 .btn-row .btn {
-  flex: 1;
+  flex: 1 1 80px;
+}
+
+.btn-row .btn-icon {
+  flex: 0 0 auto;
 }
 
 .btn-row .btn-launch {
-  flex: 2;
+  flex: 2 1 120px;
 }
 
 /* 右键菜单 */
@@ -2110,11 +2206,10 @@ body {
 
 .toast {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
+  flex-direction: column;
   background: var(--deep-purple);
   color: #fff;
-  padding: 10px 12px 10px 14px;
+  padding: 0;
   border-radius: 8px;
   border-left: 3px solid rgba(255, 255, 255, 0.35);
   font-size: 13px;
@@ -2122,9 +2217,33 @@ body {
   width: max-content;
   max-width: min(480px, calc(100vw - 24px));
   min-width: 280px;
+  overflow: hidden;
   overflow-wrap: anywhere;
   animation: toast-in 0.2s ease-out;
   pointer-events: auto;
+}
+
+.toast-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px 10px 14px;
+}
+
+/* 倒计时进度条：随剩余时间收缩，悬停暂停时冻结 */
+.toast-progress {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.18);
+  pointer-events: none;
+}
+
+.toast-progress-fill {
+  height: 100%;
+  background: rgba(255, 255, 255, 0.7);
+  /* GPU 加速过渡：0.25s 让浏览器有足够帧补中间值，translateZ 强制合成层 */
+  transition: width 0.25s ease-out;
+  transform: translateZ(0);
+  will-change: width;
 }
 
 .toast-info { background: var(--deep-purple); }
@@ -2166,19 +2285,20 @@ body {
   width: 420px;
   max-width: 90vw;
   max-height: 45vh;
-  overflow-y: auto;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   gap: 8px;
   z-index: 500;
 }
 
-/* 右上角并发任务数角标 */
+/* 右上角并发任务数角标（钉在 progress-stack 容器右上角）
+   注意 progress-stack 有 overflow: visible 才能让 top:-8px 不被裁 */
 .progress-badge {
-  position: fixed;
-  top: 12px;
-  right: 12px;
-  z-index: 450;
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  z-index: 510;
   min-width: 26px;
   height: 26px;
   padding: 0 6px;
@@ -2192,7 +2312,7 @@ body {
   justify-content: center;
   font-size: 12px;
   line-height: 1;
-  pointer-events: auto;
+  pointer-events: none;
   cursor: default;
 }
 
@@ -2202,6 +2322,8 @@ body {
   padding: 12px 16px;
   border-radius: 10px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+  user-select: none;
 }
 
 .progress-text {
@@ -2306,7 +2428,9 @@ body {
   z-index: 2;
 }
 .item-warn-icon:hover { background: rgba(234,179,8,0.25); }
-.mod-item.selected .item-warn-icon { right: 24px; }
+/* 红警告（缺依赖/版本不兼容）覆盖为红色 */
+.mod-item.warn-item .item-warn-icon { color: #ef4444; background: rgba(239,68,68,0.15); }
+.mod-item.warn-item .item-warn-icon:hover { background: rgba(239,68,68,0.25); }
 @keyframes warnPulse { 0%,100% { opacity: 0.9; } 50% { opacity: 0.55; } }
 
 /* 分类容器 */

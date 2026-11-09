@@ -99,6 +99,10 @@ class ModInfo:
     install_dir: Optional[Path]    # 磁盘绝对路径（mod 根目录）。占位 mod = None
     source: str                    # "local" / "workshop" / "disabled"
     workshop_id: Optional[str] = None  # 若来自工坊，则是发布文件 id（目录名）
+    # 2026-11-07 Step 1 新增：扫描时一次性 stat() 固化文件时间（隐藏问题 2）
+    # 绝不能每次前端渲染时实时 stat()，否则停启用搬目录会刷 ctime
+    mtime: float = 0.0
+    ctime: float = 0.0
 
     @property
     def mod_id(self) -> str:
@@ -307,10 +311,17 @@ def version_gt(a: Optional[str], b: Optional[str]) -> bool:
 
 
 def mod_version_key(info: ModInfo) -> str:
-    """一个物理副本的稳定标识（用于「选择版本」的持久化与菜单命中）。"""
+    """一个物理副本的物理层标识（用于 source_states / 菜单命中 / snapshot tuple key 第二维）。
+
+    2026-11-05 重构：加 #mod_id.lower() 后缀确保唯一性。
+    原因：合集工坊同目录平铺多个 manifest 时，多个 mod_id 共享同一个 install_dir
+    → 旧格式 str(install_dir) 会撞 key；加 mod_id 后缀后每个副本独立唯一。
+
+    注意：key 仍会随搬目录（Mods ↔ .mods_disabled）变化，互斥/比较必须用搬目录之后的新 key。
+    """
     if info.install_dir is not None:
-        return str(info.install_dir)
-    return f"placeholder:{info.mod_id}"
+        return f"{str(info.install_dir)}#{info.mod_id.lower()}"
+    return f"placeholder:{info.mod_id.lower()}"
 
 
 @dataclass
@@ -1229,16 +1240,37 @@ def _scan_folder(
 ) -> Optional[ModInfo]:
     """扫一个 mod 文件夹。
     allow_disabled_manifest=True 时扫不出正常 manifest 会尝试 .disabled 结尾的（返回 source 保持调用方传入，方便 workshop 停用态识别）。
+
+    install_dir 取 manifest 实际所在目录（find_manifest 递归搜索的结果），
+    不再硬编码成传入的 mod_dir——这对三层嵌套的 mod（如 SnakeMapMod）很关键，
+    同时也让二次补扫 wid 根目录时自动指向子目录，合并重复副本。
     """
-    manifest = read_mod_manifest(mod_dir, allow_disabled=allow_disabled_manifest)
+    mf_path = find_manifest(mod_dir, allow_disabled=allow_disabled_manifest)
+    if mf_path is None:
+        return None
+    try:
+        txt = mf_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    manifest = _try_parse_manifest_json(txt)
     if manifest is None:
         return None
+    # 2026-11-07 Step 1: stat() 一次性固化 mtime/ctime（隐藏问题 2）
+    try:
+        _st = mf_path.parent.stat()
+        _mt = _st.st_mtime
+        _ct = _st.st_ctime
+    except OSError:
+        _mt = 0.0
+        _ct = 0.0
     return ModInfo(
         manifest=manifest,
-        folder_name=mod_dir.name,
-        install_dir=mod_dir,
+        folder_name=mf_path.parent.name,
+        install_dir=mf_path.parent,
         source=source,
         workshop_id=workshop_id,
+        mtime=_mt,
+        ctime=_ct,
     )
 
 
@@ -1366,12 +1398,22 @@ def set_workshop_mod_disabled(info: ModInfo, disabled: bool, game: Optional["Gam
     if manifest is None:
         log.error("set_workshop_mod_disabled: 处理完后 %s 读不到 manifest，返回原 info", final_dir)
         return info
+    # 2026-11-07 Step 1: stat() 固化 mtime/ctime
+    try:
+        _st = final_dir.stat()
+        _mt = _st.st_mtime
+        _ct = _st.st_ctime
+    except OSError:
+        _mt = 0.0
+        _ct = 0.0
     return ModInfo(
         manifest=manifest,
         folder_name=final_dir.name,
         install_dir=final_dir,
         source=new_source,
         workshop_id=info.workshop_id,
+        mtime=_mt,
+        ctime=_ct,
     )
 
 
@@ -2760,12 +2802,20 @@ def scan_all_mods(game: GameInstall, extra_mods_dirs: Optional[list[Path]] = Non
         return False
 
     def _add(info: ModInfo) -> None:
-        k = info.mod_id.lower()
+        # 桶 key：有 workshop_id（数字）→ 派生 key "mid_lower::wid"；否则 → 基础 key mid_lower
+        # 让两个不同 Steam 工坊但 manifest mod_id 撞名的副本各自独立入桶，不合并
+        mid = info.mod_id.lower()
+        if info.workshop_id is not None:
+            _s = str(info.workshop_id)
+            k = f"{mid}::{_s}" if _s.isdigit() else mid
+        else:
+            k = mid
         # 收集所有物理副本，供「选择版本」菜单使用
         result.versions.setdefault(k, []).append(info)
-        existing = result.mods.get(k)
+        # canonical 层（_mods）用基础 key 存第一个可信副本（refresh workshop 补扫路径再用派生 key 并存）
+        existing = result.mods.get(mid)
         if existing is None or _should_override(existing, info):
-            result.mods[k] = info
+            result.mods[mid] = info
         # 进度条 tick（每识别到一个 mod 就推进一步）
         tick_scan_progress(current=info.display_name or info.mod_id)
 
@@ -2837,12 +2887,13 @@ def scan_all_mods(game: GameInstall, extra_mods_dirs: Optional[list[Path]] = Non
                 workshop_id = pub_dir.name
                 if subscribed_ids is not None and workshop_id not in subscribed_ids:
                     skipped_unsubscribed.append(workshop_id)
-                    # 仍读一下它的 manifest id，供 store.py 过滤掉 settings.save 里的同名占位条目
+                    # 记录到 unsubscribed_mod_ids 集合，供前端黄标用
                     for cand in [pub_dir] + [e for e in pub_dir.iterdir() if e.is_dir()]:
                         m = read_mod_manifest(cand, allow_disabled=True)
                         if m is not None and m.id:
                             result.unsubscribed_mod_ids.add(m.id.lower())
-                    continue
+                    # 去掉 continue —— 让未订阅 wid 正常扫进 _mods / _mod_versions
+                    # （Steam 退订残留目录里有合法 manifest 的 mod，游戏会加载但管理器要加黄标）
                 # 工坊里可能还有更深一层（有些 Steam 客户端会嵌套），两层都扫一下
                 direct_mods = [e for e in pub_dir.iterdir() if e.is_dir()] if pub_dir.is_dir() else []
                 # 这里判断"是否更深一层"时也必须允许 disabled manifest，否则被停用的 workshop mod 嵌套时永远扫不到

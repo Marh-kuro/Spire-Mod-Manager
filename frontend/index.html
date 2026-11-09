@@ -1,4 +1,4 @@
-<!-- ============================================================
+﻿﻿﻿﻿﻿﻿<!-- ============================================================
   Spire Mod Manager — 前端模板 (Vue 3 Options-style, 零构建)
   布局: 顶栏 + 四栏面板 (预览 | 停用列表 | 启用列表 | 整合包/皮肤/卡面/备份)
   设计稿: 即时设计 (js.design)
@@ -13,7 +13,13 @@
   <meta http-equiv="pragma" content="no-cache" />
   <meta http-equiv="expires" content="0" />
   <title>Spire Mod Manager</title>
-  <link rel="stylesheet" href="style.css?v=20261103c" />
+  <!-- ============================================================
+       前端版本号单一真源：任何前端 JS/CSS 改动后必须 +1 这里！
+       格式 YYYYMMDD + 单字母（a/b/c），同一天多改就加字母
+       版本号改这 + 下面 4 个标签的 ?v= 值（5 处同步）
+       ============================================================ -->
+  <script>window.__FE_VERSION__ = '20261109e';</script>
+  <link rel="stylesheet" href="style.css?v=20261109e" />
 </head>
 <body>
   <div id="app">
@@ -30,6 +36,9 @@
         </template>
         <span v-else class="game-version-badge version-unknown">{{ t('game_version_unknown') }}</span>
         <button class="btn-ghost btn-saves" @click="openSavesManager">💾 {{ t('saves_manager') }}</button>
+        <span class="topbar-ver" :title="'后端 v' + appInfo.version + ' · 前端 ' + feVer">
+          v{{ appInfo.version || '?' }} · {{ feVer }}
+        </span>
       </div>
 
       <div class="topbar-spacer"></div>
@@ -46,13 +55,23 @@
         @mouseenter="pauseToast(item)"
         @mouseleave="resumeToast(item)"
       >
-        <span class="toast-text">{{ item.text }}</span>
-        <button class="toast-close" type="button" :title="t('close')" @click.stop="dismissToast(item.id, true)">✕</button>
+        <div class="toast-main">
+          <span class="toast-text">{{ item.text }}</span>
+          <button class="toast-close" type="button" :title="t('close')" @click.stop="dismissToast(item.id, true)">✕</button>
+        </div>
+        <div v-if="item.hasBar" class="toast-progress">
+          <div class="toast-progress-fill" :data-toast-bar="item.id"></div>
+        </div>
       </div>
     </div>
 
-    <!-- 正下方只显示一条最高优先级任务；右上角角标显示并发任务数 -->
+    <!-- 正下方只显示一条最高优先级任务；右上角角标显示并发任务数（钉在 stack 容器上） -->
     <div v-if="currentProgressCard" class="progress-stack">
+      <div
+        v-if="progressTaskCount > 1"
+        class="progress-badge"
+        :title="t('tasks_running', { n: progressTaskCount })"
+      >{{ progressTaskCount }}</div>
       <div class="progress-card">
         <div class="progress-text">
           <span class="progress-title">{{ currentProgressCard.title }}</span>
@@ -69,11 +88,6 @@
         </div>
       </div>
     </div>
-    <div
-      v-if="progressTaskCount > 1"
-      class="progress-badge"
-      :title="t('tasks_running', { n: progressTaskCount })"
-    >{{ progressTaskCount }}</div>
 
     <!-- 工坊订阅登记读取失败提示（FIX-6） -->
     <div v-if="state.subscribed_known === false" class="subscribed-warn">
@@ -119,8 +133,8 @@
                   </div>
                   <!-- 作者/版本/工坊ID 三小卡片 -->
                   <div class="meta-cards">
-                    <div class="meta-card" v-if="selected && selected.author">
-                      <span class="meta-ic">👤</span><span class="meta-val">{{ selected.author }}</span>
+                    <div class="meta-card" v-if="selected && (effectiveAuthor || selected.author)">
+                      <span class="meta-ic">👤</span><span class="meta-val">{{ effectiveAuthor || selected.author }}</span>
                     </div>
                     <div class="meta-card" v-if="selected && selected.version">
                       <span class="meta-ic">📦</span><span class="meta-val">v{{ selected.version }}</span>
@@ -166,15 +180,41 @@
                 </div>
               </div>
 
-              <!-- ============ 2c) 前置依赖列表（只在启用态 mod 选中时显示） ============ -->
-              <div v-if="selected && selected.is_enabled !== false && selected.dependencies && selected.dependencies.length" class="dep-block">
+              <!-- ============ 2c) 前置依赖列表（固定显示，不管启停） ============ -->
+              <div v-if="selected && selected.dependencies && selected.dependencies.length" class="dep-block">
                 <div class="dep-block-title">📦 {{ t('deps_label') }}</div>
                 <div class="dep-list">
-                  <div v-for="ds in selected.dep_statuses" :key="ds.id" class="dep-row" :class="ds.status">
-                    <span class="dep-icon">{{ ds.status === 'ok' ? '🟢' : ds.status === 'missing_enable' ? '🟡' : '🔴' }}</span>
+                  <div v-for="ds in selected.dep_statuses" :key="ds.id" class="dep-row">
                     <span class="dep-name">{{ ds.id }}</span>
-                    <span class="dep-label">{{ t('dep_status_' + ds.status, { name: ds.id }) }}</span>
                   </div>
+                </div>
+              </div>
+
+              <!-- ============ 2c2) 同文件夹兄弟 Mod 提示（可收起） ============ -->
+              <div v-if="selectedSiblings.length > 0" class="sibling-block">
+                <div class="sibling-title" @click="previewCollapse.siblings = !previewCollapse.siblings" style="cursor:pointer;">
+                  <span>{{ previewCollapse.siblings ? '▶' : '▼' }}</span> 📁 {{ t('sibling_label', { n: selectedSiblings.length }) }}
+                </div>
+                <div v-show="!previewCollapse.siblings" class="sibling-list">
+                  <span v-for="s in selectedSiblings" :key="s.id + '-' + (s.path || '')" class="sibling-tag" :title="s.path">
+                    {{ s.name || s.id }} <span class="sibling-side">· {{ s.is_enabled ? (t('sibling_side_on') || '启用') : (t('sibling_side_off') || '停用') }}</span>
+                  </span>
+                </div>
+              </div>
+
+              <!-- ============ 2c3) 状态信息（调试用：时间戳 + 路径） ============ -->
+              <div v-if="selected" class="sibling-block">
+                <div class="sibling-title" @click="previewCollapse.status = !previewCollapse.status" style="cursor:pointer;">
+                  <span>{{ previewCollapse.status ? '▶' : '▼' }}</span> 🔧 状态信息
+                </div>
+                <div v-show="!previewCollapse.status" class="sibling-list preview-status-info">
+                  <div class="status-row"><span class="status-k">来源</span><span class="status-v">{{ selected.source || '—' }} <span v-if="selected.install_dir" class="status-path">{{ selected.install_dir }}</span></span></div>
+                  <div class="status-row" v-if="selected.created_at"><span class="status-k">创建</span><span class="status-v">{{ selected.created_at }}</span></div>
+                  <div class="status-row" v-if="selected.modified_at"><span class="status-k">修改</span><span class="status-v">{{ selected.modified_at }}</span></div>
+                  <div class="status-row" v-if="selected.last_activity"><span class="status-k">最近活跃</span><span class="status-v">{{ fmtTs(selected.last_activity) }}</span></div>
+                  <div class="status-row" v-if="selected.enabled_at"><span class="status-k">上次启用</span><span class="status-v">{{ fmtTs(selected.enabled_at) }}</span></div>
+                  <div class="status-row" v-if="selected.disabled_at"><span class="status-k">上次停用</span><span class="status-v">{{ fmtTs(selected.disabled_at) }}</span></div>
+                  <div class="status-row" v-if="selected.mod_state_key"><span class="status-k">状态 key</span><span class="status-v mono">{{ selected.mod_state_key }}</span></div>
                 </div>
               </div>
 
@@ -242,38 +282,27 @@
       <!-- 栏2: 停用 Mod 列表 (左) -->
       <section class="card">
         <div class="card-title"><span></span>{{ t('disabled_title') }}</span><span class="mod-count">{{ displayList([], 'disabled', disabledSearch).length }}</span></div>
-        <div class="mod-breakdown" v-if="breakdown && breakdown.workshop_dirs_total > 0">
-          扫描 {{ breakdown.workshop_dirs_total }} 个工坊目录
-          <template v-if="breakdown.unsubscribed_skipped > 0">
-            · 跳过 {{ breakdown.unsubscribed_skipped }} 个未订阅残留
-          </template>
-          <template v-if="breakdown.native_list_total > 0">
-            · settings.save {{ breakdown.native_list_total }} 条
-          </template>
-          <template v-if="breakdown.merged_duplicate_sources > 0">
-            · {{ breakdown.merged_duplicate_sources }} 个合并重复源
-          </template>
-          <span class="breakdown-total">→ 显示 {{ breakdown.final_total }} 个</span>
-        </div>
         <div class="search-row">
           <input v-model="disabledSearch" :placeholder="t('search_disabled')" class="search-input" />
         </div>
         <ul class="mod-list disabled-mod-list">
-          <li v-for="m in displayList(filteredDisabled, 'disabled', disabledSearch)" :key="'d-'+m.__version_key"
+          <li v-for="(m, idx) in displayList(filteredDisabled, 'disabled', disabledSearch)" :key="'d-'+m.__row_key"
               class="mod-item disabled-item"
               :data-ver-key="m.__version_key"
-              :class="{ selected: selected && selected.__version_key === m.__version_key, 'multi-selected': multiSelected.includes(m.__version_key) }"
+              :class="{ selected: selected && selected.__row_key === m.__row_key, 'multi-selected': multiSelected.includes(m.__row_key) }"
               @click="select(m, 'disabled', $event)"
               @dblclick="dblClickHandler(m)"
               @contextmenu.prevent="openMenu($event, m)"
-              :title="m.install_path || ''">
+              :title="m.path || ''">
             <div class="mod-title" :style="m.mod_color ? { color: m.mod_color } : {}">
                   <span class="drag-grip" title="拖到右侧启用 / 拖动"
                         @pointerdown.stop="onDragStart($event, -1, m, 'disabled')">
                     <span class="mod-type-icon" :title="m.mod_type_label">{{ m.mod_type_icon }}</span>
                     <span class="source-badge" :class="'src-'+(m.external_source || m.source)" :title="m.source_label">{{ m.source_label }}</span>
+                    <span v-if="m.is_unsubscribed" class="source-badge src-unsub" title="Steam 未订阅（目录残留）">未订阅</span>
                   </span>
                   <span v-if="m.pinned" class="pinned-badge" :title="'已锁定: ' + (m.pinned.version || '')">{{ m.pinned.enabled !== undefined ? (m.pinned.enabled ? '📌' : '🆘') : '📌' }}</span>
+                  <span class="seq-num">{{ idx + 1 }}.</span>
                   {{ m.name }}
                 </div>
             <div class="mod-sub">{{ subText(m) }}</div>
@@ -284,9 +313,6 @@
       <!-- 栏3: 启用 Mod 列表 (右) — 含 SVG 依赖线层 + 拖拽 placeholder -->
       <section class="card">
         <div class="card-title"><span>{{ t('enabled_title') }}</span><span class="mod-count">{{ displayList([], 'enabled', enabledSearch).length }}</span></div>
-        <div class="mod-breakdown" v-if="breakdown && breakdown.workshop_dirs_total > 0">
-          启用 {{ breakdown.final_enabled }} / 停用 {{ breakdown.final_disabled }} · 合并重复源 {{ breakdown.merged_duplicate_sources }} 个
-        </div>
         <div class="search-row">
           <input v-model="enabledSearch" :placeholder="t('search_enabled')" class="search-input" />
         </div>
@@ -296,35 +322,40 @@
           <div v-if="indicatorStyle" class="drag-indicator" :style="indicatorStyle"></div>
           <ul class="mod-list enabled-list" @scroll="onDepScroll" ref="enabledListRef">
             <li v-for="(m, idx) in dragRenderList"
-                :key="m.__version_key"
+                :key="m.__row_key"
                 class="mod-item"
                 :data-id="m.id"
                 :data-ver-key="m.__version_key"
                 :class="{
-                  selected: selected && selected.__version_key === m.__version_key,
-                  'multi-selected': multiSelected.includes(m.__version_key),
-                  'warn-item': m.has_dep_warning,
-                  dragging: drag.active && drag.fromMod && drag.fromMod.__version_key === m.__version_key,
+                  selected: selected && selected.__row_key === m.__row_key,
+                  'multi-selected': multiSelected.includes(m.__row_key),
+                  'warn-item': m.has_dep_warning || m.game_incompat || m.has_dup_copies,
+                  dragging: drag.active && drag.fromMod && drag.fromMod.__row_key === m.__row_key,
                   'dup-warn': m.dep_flags && m.dep_flags.includes('dup_warn'),
+                  'yellow-folder': m.has_siblings && !m.is_bundle && !m.has_dep_warning && !m.game_incompat && !m.has_dup_copies,
                 }"
                 :style="m.mod_color ? { color: m.mod_color } : {}"
                 @click="select(m, 'enabled', $event)"
                 @dblclick="dblClickHandler(m)"
                 @contextmenu.prevent="openMenu($event, m)"
-                :title="m.install_path || ''">
+                :title="m.path || ''">
               <div class="mod-title">
                   <span class="drag-grip" title="拖动排序 / 拖回左侧停用"
                         @pointerdown.stop="onDragStart($event, idx, m, 'enabled')">
                     <span class="mod-type-icon" :title="m.mod_type_label">{{ m.mod_type_icon }}</span>
                     <span class="source-badge" :class="'src-'+(m.external_source || m.source)" :title="m.source_label">{{ m.source_label }}</span>
+                    <span v-if="m.is_unsubscribed" class="source-badge src-unsub" title="Steam 未订阅（目录残留）">未订阅</span>
                     <span v-if="m.pinned" class="pinned-badge" :title="'已锁定: ' + (m.pinned.version || '')">{{ m.pinned.enabled !== undefined ? (m.pinned.enabled ? '📌' : '🆘') : '📌' }}</span>
                   </span>
+                  <span class="seq-num">{{ idx + 1 }}.</span>
                   {{ m.name }}
+                  <span v-if="m.is_bundle" class="bundle-badge" :title="itemWarnTitle(m)">📦 {{ t('bundle_badge_label', { n: m.bundle_size }) }}</span>
                 </div>
                 <div class="mod-sub">{{ subText(m) }}</div>
-                <span v-if="m.has_dep_warning || (m.dep_flags && m.dep_flags.includes('dup_warn'))"
+                <span v-if="m.has_dep_warning || m.game_incompat || m.has_siblings || m.has_dup_copies || (m.dep_flags && m.dep_flags.includes('dup_warn'))"
                       class="item-warn-icon"
-                      :title="depWarnTitle(m)">⚠</span>
+                      :class="{ 'yellow-icon': m.has_siblings && !m.is_bundle && !m.has_dep_warning && !m.game_incompat && !m.has_dup_copies }"
+                      :title="itemWarnTitle(m)">⚠</span>
             </li>
           </ul>
         </div>
@@ -433,18 +464,15 @@
         <div v-if="packTab !== 'backups'" class="btn-row">
           <button class="btn" @click="scan">{{ t('scan') }}</button>
           <button class="btn" @click="autoSort">{{ t('sort') }}</button>
-          <button class="btn" @click="save">{{ t('save') }}</button>
-          <button class="btn btn-icon" :title="t('log_tip')" @click="openLogDiag">🩺</button>
-          <div class="btn-spacer"></div>
-          <!-- P0: 导出按钮 -->
-          <button class="btn btn-icon" title="导出 CSV" @click="doExport('csv')">📋</button>
-          <button class="btn btn-icon" title="导出 Markdown" @click="doExport('markdown')">📝</button>
+          <button class="btn btn-save" :class="{ 'btn-dirty': hasUnsavedChanges }" @click="save">
+            {{ hasUnsavedChanges ? t('save_changes') : t('save') }}<span v-if="hasUnsavedChanges" class="dirty-mark">*</span>
+          </button>
         </div>
         <div v-if="packTab !== 'backups'" class="btn-row">
+          <button class="btn btn-icon" :title="t('log_tip')" @click="openLogDiag">🩺</button>
+          <button class="btn btn-icon" title="导出 CSV" @click="doExport('csv')">📋</button>
+          <button class="btn btn-icon" title="导出 Markdown" @click="doExport('markdown')">📝</button>
           <button class="btn btn-icon" :title="t('clear_enabled_tip')" @click="clearEnabled">🔄</button>
-          <span v-if="multiSelectedCount > 0" class="multi-indicator">{{ t('multi_selected', { n: multiSelectedCount }) }}</span>
-          <!-- P0: Steam ID 显示 -->
-          <span v-if="state.steam_id" class="steam-id-badge" :title="'当前写入 settings.save 的账号: ' + state.steam_id">{{ state.steam_id }}</span>
           <button class="btn btn-launch" @click="launch">{{ launchText }}</button>
         </div>
         <!-- 备份页签专用按钮 -->
@@ -691,6 +719,16 @@
               <div class="path-row">
                 <input v-model="settings.form.manual_mods_dir" :placeholder="t('ph_mods')" />
                 <button class="btn" @click="pickFolder('manual_mods_dir')">{{ t('browse') }}</button>
+              </div>
+              <label>{{ t('extra_mods_label') }}</label>
+              <p class="hint">{{ t('extra_mods_desc') }}</p>
+              <div class="multi-path-list">
+                <div v-for="(p, i) in settings.form.extra_mods_list" :key="i" class="path-row">
+                  <input v-model="settings.form.extra_mods_list[i]" :placeholder="t('ph_mods')" />
+                  <button class="btn" @click="pickFolder('extra_mods_list[' + i + ']')">{{ t('browse') }}</button>
+                  <button class="btn btn-icon" @click="settings.form.extra_mods_list.splice(i, 1)" :title="t('remove_dir')">✕</button>
+                </div>
+                <button class="btn" @click="settings.form.extra_mods_list.push('')">{{ t('add_extra_dir') }}</button>
               </div>
               <label>{{ t('save_dir') }}</label>
               <div class="path-row">
@@ -1025,8 +1063,8 @@
   </div>
 
   <script src="vue.global.prod.js?v=1"></script>
-  <script src="i18n.js?v=20261102a"></script>
-  <script src="api.js?v=20261102a"></script>
-  <script src="app.js?v=20261103e"></script>
+  <script src="i18n.js?v=20261109e"></script>
+  <script src="api.js?v=20261109e"></script>
+  <script src="app.js?v=20261109e"></script>
 </body>
 </html>

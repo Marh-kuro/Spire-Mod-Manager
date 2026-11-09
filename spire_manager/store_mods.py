@@ -51,6 +51,11 @@ from .store_core import *  # noqa: F403  re-export 常量 + ManagerState + _seri
 
 _log = get_logger("store")
 
+# 工坊依赖缓存文件读写锁（api.py fetch_mod_deps 写 ↔ store refresh 回填读，共享这把锁）
+_DEPS_CACHE_LOCK = threading.Lock()
+# 工坊依赖缓存过期：7 天
+_DEPS_CACHE_TTL = 7 * 24 * 3600
+
 
 class ModManager:
     """封装持久化 + 启用/停用/排序操作。对外的工作单位是 mod_id（不区分大小写）。
@@ -122,8 +127,13 @@ class ModManager:
         # 同 mod_id 的工坊副本和本地副本各自独立启停，互不影响
         self._source_states: dict[str, dict[str, bool]] = {}
         # 各 source 副本最近一次 toggle 的时间戳（前端 displayList 停用侧排序用）
-        # 格式：{ lower_mod_id: { "steam_workshop": timestamp, "mods_directory": timestamp } }
+        # 格式：{ lower_mod_id: { version_key: timestamp } }
         self._source_last_toggled: dict[str, dict[str, float]] = {}
+        # 各副本最近一次启用时间戳（profile.json 持久化）
+        self._source_enabled_at: dict[str, dict[str, float]] = {}
+        # 各副本最近一次停用时间戳（profile.json 持久化，停用侧排序主依据）
+        self._source_disabled_at: dict[str, dict[str, float]] = {}
+        # 2026-11-07 彻底删 batch_seq，换微秒差
         self._state = ManagerState.default()
         self._errors: list[str] = []
         # P0: Steam 工坊在线信息缓存 {workshop_id: SteamModInfo}
@@ -163,6 +173,10 @@ class ModManager:
         self._refresh_gate_lock = threading.Lock()
         self._refresh_in_progress = False
         self._refresh_ticket: Optional[dict] = None
+        # 前端副本级待提交意图：{bucket_key: {mod_version_key: bool}}
+        # 只由 apply_frontend_delta 累积，commit_changes 消费，refresh 前清空；
+        # 不写入 _source_states（后者是持久化基线，供 commit 做 diff）
+        self._desired_copy_states: dict[str, dict[str, bool]] = {}
         # ── O2: 启用/停用侧缓存（避免每次 ordered_enabled() 重建 list + O(N) 遍历） ──
         # 预计算 enabled 侧的 list/set/id-index，所有依赖检查、状态读取直接查缓存；
         # 任何会改 enabled_order/disabled_order/_mods 的操作（refresh/set_enabled/delete/
@@ -174,6 +188,8 @@ class ModManager:
 
         # 工坊订阅登记（appworkshop_*.acf）本次扫描是否成功读取；False 表示可能漏显/误判
         self._subscribed_known: bool = True
+        # 扫描到的未订阅工坊 mod_id.lower() 集合（Steam 退订残留目录，需加黄标）
+        self._unsubscribed_mod_ids: set[str] = set()
         # 上一次扫描识别到的工坊 mod 数（用于 settings.save 写回健康度门禁：骤降即跳过写回）
         self._last_ws_mod_count: int = 0
 
@@ -447,6 +463,9 @@ class ModManager:
         # settings.save 只按 canonical 粒度写（游戏不认 source），per-source 状态独立存 profile.json
         payload["source_states"] = self._source_states
         payload["source_last_toggled"] = self._source_last_toggled
+        payload["source_enabled_at"] = self._source_enabled_at
+        payload["source_disabled_at"] = self._source_disabled_at
+        # 2026-11-07: batch_seq 彻底删，用微秒差替代
         content = json.dumps(payload, ensure_ascii=False, indent=2)
         with self._save_lock:
             # .bak 备份（与 save_bmm_settings / save_native_mod_list 同安全级别）
@@ -591,6 +610,7 @@ class ModManager:
         self._mods = {}
         self._mod_versions = {}
         self._source_states = {}
+        self._desired_copy_states = {}
         self._source_last_toggled = {}
         self._native_save_path = None
         self._native_full_data = None
@@ -2031,6 +2051,8 @@ class ModManager:
         主程序启动后台扫描和前端 refresh 可能同时触发；如果两个都真正执行，
         会各自启动依赖爬取线程，导致 HTML 请求叠加触发 Steam 429。
         """
+        # 新扫描 = 新基线：清空前端未提交的副本级意图，避免污染本次分类
+        self._desired_copy_states = {}
         key = (
             str(Path(manual_game_root).resolve())
             if manual_game_root
@@ -2146,6 +2168,7 @@ class ModManager:
         self._mod_versions = scan.versions
         self._errors.extend(scan.errors)
         self._subscribed_known = bool(getattr(scan, "subscribed_known", True))
+        self._unsubscribed_mod_ids = set(getattr(scan, "unsubscribed_mod_ids", set()))
 
         # 爬 Steam 工坊依赖延后到启用/停用分类确定之后启动，
         # 否则 enabled_order 尚未同步，初始目标会退化为全库工坊 mod。
@@ -2184,13 +2207,18 @@ class ModManager:
             # per-source 状态独立存 profile.json
             # 优先级：profile.json source_states > settings.save（兼容老数据）
             profile_data: dict = {}
-            try:
-                if self.profile_path.is_file():
-                    profile_data = json.loads(self.profile_path.read_text(encoding="utf-8"))
-            except Exception:
-                profile_data = {}
+            # 2026-11-06 P3：与 save_state 共用同一把锁，避免读到 os.replace 的中间态/半写文件
+            with self._save_lock:
+                try:
+                    if self.profile_path.is_file():
+                        profile_data = json.loads(self.profile_path.read_text(encoding="utf-8"))
+                except Exception:
+                    profile_data = {}
             profile_ss = profile_data.get("source_states") if isinstance(profile_data, dict) else None
-            if isinstance(profile_ss, dict) and profile_ss:
+            if isinstance(profile_ss, dict):
+                # 只检查 isinstance(dict)，不加 truthy 检查：空 dict {} 也是合法的
+                # （表示"用户还没通过管理器启停过任何 mod"），不应该 fallback 到 settings.save
+                # （settings.save fallback 只返回 mod_list 里有的条目，漏掉大部分 workshop mod → Bug D）
                 self._source_states = profile_ss
                 _log.info(
                     "refresh: source_states 从 profile.json 恢复: %d 个 mod_id（其中 %d 个有 ≥2 个 source）",
@@ -2205,55 +2233,135 @@ class ModManager:
                     len(self._source_states),
                 )
 
+            # source_last_toggled / enabled_at / disabled_at / batch_seq 恢复（老 profile.json 无这些 key → 空 dict）
+            if isinstance(profile_data, dict):
+                self._source_last_toggled = profile_data.get("source_last_toggled", {}) or {}
+                self._source_enabled_at = profile_data.get("source_enabled_at", {}) or {}
+                self._source_disabled_at = profile_data.get("source_disabled_at", {}) or {}
+                # 2026-11-07: batch_seq 彻底删，refresh 不再恢复
+
             # 2026-10-15 迁移：把老的 "mods_directory" / 不认识的 inner key 替换成正确的 per-physical-copy key
-            # 老 profile.json 和老 settings.save 里本地副本统一叫 "mods_directory"，
-            # 导致 local + disabled 两个物理不同的副本撞 key → 一个覆盖另一个。
-            # 迁移策略：用 _mod_versions 里的实际物理副本构建合法 inner key 集合，
-            # 老 key 如果无法精确映射 → 丢掉，从 settings.save is_enabled + 物理位置重建。
-            _migrated = 0
-            for mid_lower, old_ss in list(self._source_states.items()):
+            # 2026-11-06 再迁移：outer key 从 mod_id.lower() 改成 bucket_key
+            # 两层迁移合成一个循环，避免多次重建。
+            _migrated_inner = 0
+            _migrated_outer = 0
+            new_source_states: dict[str, dict] = {}  # 新 outer key → 新 inner dict
+            # 2026-11-09: bucket_key 格式的 outer key 排后面处理，
+            # 因为 available_versions(纯 mod_id) 会返回所有副本，但纯 mod_id 的 old_ss 只有 local_disabled 的 inner key，
+            # workshop 副本在纯 mod_id 的 old_ss 里查不到 → fallback 错给 False → 覆盖 bucket_key 循环的精确 True。
+            # 让 bucket_key 后处理，它的精确 old_ss 值会覆盖纯 mod_id 循环的 fallback 错值。
+            _all_keys = list(self._source_states.items())
+            _all_keys.sort(key=lambda _x: "::" in _x[0])  # 纯 mod_id(False=0) 先，bucket_key(True=1) 后
+            for mid_lower, old_ss in _all_keys:
                 if not isinstance(old_ss, dict):
                     continue
-                # 构建这个 mod_id 有哪些物理副本 → 合法 inner keys（2026-11-01 新格式）
-                versions = self._mod_versions.get(mid_lower, [])
-                valid_keys: set[str] = set()
-                for v in versions:
-                    # 2026-11-04: 统一用 mod_version_key（物理副本唯一标识 = str(install_dir)）
-                    valid_keys.add(mod_version_key(v))
-                # 如果没有物理副本（ghost），跳过
-                if not valid_keys:
-                    continue
-                # 检查是否有老 key（不在合法集合里）
+                # 2026-11-06: outer key 可能已经是 bucket_key 格式（带 "::"）
+                # mid_lower = "baselib::3737335127" → mid_pure = "baselib"（settings.save 比较需要）
+                # mid_lower 本身传给 available_versions 能精确命中 _mod_versions（bucket_key 格式）
+                mid_pure = mid_lower.split("::")[0]
+                versions = self.available_versions(mid_lower)
+                if not versions:
+                    continue  # ghost mod，跳过
+                # 构建这个 mod_id 下所有物理副本 → 合法 inner keys
+                valid_keys: set[str] = {mod_version_key(v) for v in versions}
                 old_keys = set(old_ss.keys())
-                if old_keys <= valid_keys:
-                    continue  # 已经是新格式
-                # 迁移！所有 key 都用新格式，老格式 "steam_workshop" 丢掉
-                _migrated += 1
-                new_ss: dict[str, bool] = {}
-                # 老 key 无法精确映射（比如老的 "steam_workshop" 不知道对应哪个 ws_{wid}）
-                # → 从物理位置推断默认值 + 老的 "mods_directory" 值兜底
+                has_inner_old = not (old_keys <= valid_keys)
+
+                # 推断每个物理副本的状态（复用原 inner key 迁移逻辑）
                 canonical_enabled = bool(
                     next(
                         (e.get("is_enabled") for e in self._native_full_data.get("mod_settings", {}).get("mod_list", [])
-                         if isinstance(e, dict) and str(e.get("id", "")).lower() == mid_lower),
+                         if isinstance(e, dict) and str(e.get("id", "")).lower() == mid_pure),
                         False,
                     )
                 )
                 mods_dir_old_value = old_ss.get("mods_directory")
                 for v in versions:
-                    key = mod_version_key(v)
+                    vk = mod_version_key(v)  # 新 inner key = install_dir#mod_id.lower()
+                    old_k = str(v.install_dir)  # 老 inner key（不带 #mod_id）
+                    # 2026-11-06 BUG FIX: inner key 查找同时尝试新格式 + 老格式
+                    # 老 profile.json 里的 inner key 是 str(install_dir)（P0 之前的格式），
+                    # 用新 key vk 查老 dict 当然查不到 → 全部 fallback 到 canonical_enabled → 全 False！
+                    # 修复：优先查新格式，查不到查老格式，都查不到才 fallback。
+                    found_val = None
+                    if vk in old_ss:
+                        found_val = old_ss[vk]
+                    elif old_k in old_ss:
+                        found_val = old_ss[old_k]
+
                     if v.source == "local":
-                        new_ss[key] = True if mods_dir_old_value is None else bool(mods_dir_old_value)
+                        if found_val is not None:
+                            val = found_val
+                        else:
+                            val = True if mods_dir_old_value is None else bool(mods_dir_old_value)
                     elif v.source == "disabled":
-                        new_ss[key] = False
+                        val = found_val if found_val is not None else False
                     else:
                         # workshop 副本
-                        new_ss[key] = bool(mods_dir_old_value) if mods_dir_old_value is not None else canonical_enabled
-                self._source_states[mid_lower] = new_ss
-                _log.info("refresh: source_states 迁移 mod_id=%s: 老 key=%s → 新 %s",
-                         mid_lower, old_keys - valid_keys, new_ss)
-            if _migrated:
-                _log.warning("refresh: source_states 迁移完成: %d 个 mod_id 从老格式迁移到 per-physical-copy 格式", _migrated)
+                        if found_val is not None:
+                            val = found_val
+                        else:
+                            val = bool(mods_dir_old_value) if mods_dir_old_value is not None else canonical_enabled
+                    # 分发到新 outer key（bucket_key）
+                    bk = self._bucket_key(v.mod_id, v.workshop_id)
+                    new_source_states.setdefault(bk, {})[vk] = val
+
+                if has_inner_old:
+                    _migrated_inner += 1
+                    _log.debug("refresh: source_states inner 迁移 mod_id=%s: 老 key=%s → 新 %s",
+                              mid_pure, old_keys - valid_keys,
+                              {bk: d for bk, d in new_source_states.items() if bk.split("::")[0] == mid_pure})
+                # 如果老 outer key 和某个新 bucket_key 不同（派生桶存在）→ 算 outer 迁移
+                base_bk = self._bucket_key(mid_lower)
+                if base_bk != mid_lower or any(self._bucket_key(v.mod_id, v.workshop_id) != mid_lower for v in versions):
+                    _migrated_outer += 1
+
+            if _migrated_inner or _migrated_outer:
+                self._source_states = new_source_states
+                _log.warning(
+                    "refresh: source_states 迁移完成: inner=%d, outer=%d",
+                    _migrated_inner, _migrated_outer,
+                )
+            else:
+                # 没有迁移 → 但也要检查 outer key 是否需要迁移
+                # （inner 已经是新格式但 outer 还老格式的中间状态）
+                needs_outer = False
+                test_v = next(iter(self._mods.values()), None)
+                if test_v is not None:
+                    # 检查任意一个 source_states 的 outer key 是否还是老格式（不含 "::" 且有派生桶存在）
+                    for old_outer in list(self._source_states.keys()):
+                        if "::" in old_outer:
+                            continue  # 已经是新格式
+                        # 检查这个 old_outer 对应的 mod_id 是否有派生桶
+                        for v in self._mods.values():
+                            if v.mod_id.lower() == old_outer and v.workshop_id is not None:
+                                needs_outer = True
+                                break
+                        if needs_outer:
+                            break
+                if needs_outer:
+                    # 用上面同样的分发逻辑（但 inner 已经对了，不需要再迁移 inner）
+                    for old_outer, old_inner in list(self._source_states.items()):
+                        mid_lower = old_outer
+                        if "::" in mid_lower:
+                            continue  # 已是新格式
+                        versions = self.available_versions(mid_lower)
+                        if not versions:
+                            continue
+                        for v in versions:
+                            vk = mod_version_key(v)
+                            if vk not in old_inner:
+                                continue
+                            bk = self._bucket_key(v.mod_id, v.workshop_id)
+                            new_source_states.setdefault(bk, {})[vk] = old_inner[vk]
+                        if old_outer not in new_source_states or old_outer in self._mods:
+                            continue  # 基础桶还在，保留
+                        self._source_states.pop(old_outer, None)
+                    if new_source_states:
+                        # 合并：把 new_source_states 里有但 self._source_states 没有的写进去
+                        for bk, inner in new_source_states.items():
+                            self._source_states.setdefault(bk, {}).update(inner)
+                        _log.warning("refresh: source_states outer key 迁移完成（懒迁移路径）")
 
             # source_last_toggled 同理
             profile_st = profile_data.get("source_last_toggled") if isinstance(profile_data, dict) else None
@@ -2348,33 +2456,6 @@ class ModManager:
                             return True
                         return False
 
-                    def _compute_store_key(mod_id: str, workshop_id: Optional[str]) -> str:
-                        """生成 store 唯一 key。
-
-                        当多个 workshop mod 内部 mod_id 相同但 workshop_id 不同时，
-                        用派生 key 并存（而非覆盖）。比如 ShengZhuSts2Mod 的原版和修复版
-                        mod.json 里 id 都是 ShengZhuSts2Mod，但 workshop_id 分别是
-                        3747713325 和 3815666326。
-                        """
-                        low = mod_id.lower()
-                        # 基本 key 不存在 → 直接用基本 key
-                        if low not in self._mods:
-                            return low
-                        existing = self._mods[low]
-                        # 如果 existing 的 workshop_id 相同，说明是同一个 mod，正常覆盖逻辑处理
-                        if existing.workshop_id == workshop_id:
-                            return low
-                        # 不同 workshop_id → 用派生 key 并存
-                        # 先检查派生 key 是否已存在
-                        derived = f"{low}::{workshop_id}"
-                        if derived not in self._mods:
-                            return derived
-                        # 极端情况：派生 key 也被占了，再加点后缀
-                        counter = 2
-                        while f"{low}::{workshop_id}::{counter}" in self._mods:
-                            counter += 1
-                        return f"{low}::{workshop_id}::{counter}"
-
                     # 二次补扫也必须与主扫描一致：跳过未订阅的工坊残留目录（读到登记才过滤）
                     subscribed_ids = read_subscribed_workshop_ids(self._game.workshop_dir)
                     for pub_dir in sorted(self._game.workshop_dir.iterdir()):
@@ -2389,19 +2470,26 @@ class ModManager:
                             real_info = _scan_folder(pub_dir, source="disabled", workshop_id=pub_dir.name,
                                                      allow_disabled_manifest=True)
                         if real_info is not None:
-                            store_key = _compute_store_key(real_info.mod_id, pub_dir.name)
-                            existing = self._mods.get(store_key)
-                            # 派生 key（同 id 不同 ws）→ 总是并存（existing 一定是 None）
-                            # 基本 key → 用 override 逻辑判断
-                            should_add = (existing is None) or (
-                                "::" not in store_key and _workshop_entry_should_override(existing, real_info)
-                            )
-                            if should_add:
-                                self._mods[store_key] = real_info
-                                if existing is None:
-                                    placeholders_added += 1
-                                else:
-                                    placeholders_updated += 1
+                            mid = real_info.mod_id.lower()
+                            bk = self._bucket_key(real_info.mod_id, pub_dir.name)
+                            # 1) 二次补扫发现的物理副本一律写入 _mod_versions（按 install_dir 去重），
+                            #    否则该副本只存在于 _mods、保存时遍历 _mod_versions 会把它丢掉。
+                            bucket = self._mod_versions.setdefault(bk, [])
+                            _dir = str(real_info.install_dir)
+                            _idx = next((i for i, v in enumerate(bucket)
+                                         if str(v.install_dir) == _dir), None)
+                            if _idx is None:
+                                bucket.append(real_info)
+                                placeholders_added += 1
+                            else:
+                                if bucket[_idx] is not real_info:
+                                    bucket[_idx] = real_info
+                                placeholders_updated += 1
+                            # 2) _mods 只存纯 mod_id 的一个 canonical 代表，禁止写 bucket_key；
+                            #    同 mod_id 的其它工坊副本靠 _mod_versions + all_versions 展开。
+                            existing = self._mods.get(mid)
+                            if existing is None or _workshop_entry_should_override(existing, real_info):
+                                self._mods[mid] = real_info
                 except Exception as e:
                     _log.warning("refresh: workshop_dir 二次补扫失败, 但主流程不中断: %s", e)
 
@@ -2450,23 +2538,28 @@ class ModManager:
             #   本地 mod 物理位置决定（source=="disabled" 归停用侧）
             nat_disabled_lower = {m.lower() for m in nat_disabled}
 
-            def _is_disabled_side(info) -> bool:
-                if info.workshop_id or info.source == "workshop":
-                    # 1) 优先查 profile.json 的 _source_states（用户权威——明确写了每个物理副本的启停）
-                    ss = self._source_states.get(info.mod_id.lower(), {})
-                    state_key = mod_version_key(info)
-                    if state_key in ss:
-                        return ss[state_key] is False
-                    # 2) 再看 settings.save 的 nat_disabled_lower（兼容老数据：用户从没通过管理器停过这个 workshop mod）
-                    return info.mod_id.lower() in nat_disabled_lower
-                return info.source == "disabled"
-
+            # 2026-11-06 重构：多副本 canonical 聚合
+            # 旧代码只看 canonical info 对应的一个 bucket_key，同 mod_id 多 workshop 时完全忽略其他副本
+            # → watcher 其中一个副本启用（wid=3747526116 state=True）、另一个停用（wid=3747492505 state=False）
+            #    结果 watcher 整个被归到停用侧 → enabled_order 里没有 watcher → 双击没反应
+            # 新逻辑：canonical 算停用侧 = 所有副本的 _copy_baseline_enabled 都返回 False
+            #         任何一个副本 baseline=True → 算启用侧
+            # 复用 _copy_baseline_enabled（它已正确处理 source_states → settings.save → 物理位置三级优先级）
             phys_disabled_lower: set[str] = {
-                mid.lower() for mid, info in self._mods.items() if _is_disabled_side(info)
+                mid for mid in self._mods
+                if not any(
+                    self._copy_baseline_enabled(v)
+                    for v in self.available_versions(mid)
+                )
             }
             phys_enabled_lower: set[str] = set(present_lower) - phys_disabled_lower
 
             def _merge_keep(prev: list[str], side_lower: set[str]) -> list[str]:
+                # 2026-11-08 防御：side_lower 空但 prev 非空 → upstream bug（_copy_baseline_enabled 全 False
+                # 或 source_states 迁移后值全 False 导致 phys_enabled_lower 空），
+                # 直接返回 prev 保留用户历史顺序，不要把 enabled_order 清空。
+                if not side_lower and prev:
+                    return list(prev)
                 out: list[str] = []
                 seen: set[str] = set()
                 # 2026-11-01 改：profile.json（prev）是用户权威顺序，settings.save 只做新发现的兜底。
@@ -2555,17 +2648,58 @@ class ModManager:
             self._bmm_profiles = {}
             _log.info("refresh: 已启用纯游戏源逻辑（prefer_better_mod_menu=False），忽略 BetterModMenu，用目录驱动决定启用/停用")
 
-        # 爬 Steam 工坊依赖 → 纯后台线程（撞 429 也不阻塞 refresh）
-        # 必须放在启用/停用分类确定之后，初始目标才拿得到权威 enabled_order。
-        def _bg_merge_deps() -> None:
-            try:
-                _log.info("[ws-deps] 后台依赖爬取开始（不阻塞 UI）")
-                self._merge_workshop_deps(scan)
-                _log.info("[ws-deps] 后台依赖爬取完成")
-            except Exception as e:
-                _log.exception("[ws-deps] 后台依赖爬取失败: %s", e)
+        # 已禁用（2026-11-05）：启动时全量爬依赖会对启用列表 160+ 个 mod 发 HTML 请求，
+        # 10–20 次串行后必撞 Steam 社区 429 熔断，关闭 10 分钟。
+        # 改为按需触发：用户点预览/启用时 api.py fetch_mod_deps 走同一套 _fetch_html，
+        # 有全局熔断锁 + wid 级 20s 复用窗口，请求量可控且不会叠加。
+        # 函数体 _bg_merge_deps 保留，将来设置页加"启动预加载依赖"复选框时只需取消下两行注释。
+        # def _bg_merge_deps() -> None:
+        #     try:
+        #         _log.info("[ws-deps] 后台依赖爬取开始（不阻塞 UI）")
+        #         self._merge_workshop_deps(scan)
+        #         _log.info("[ws-deps] 后台依赖爬取完成")
+        #     except Exception as e:
+        #         _log.exception("[ws-deps] 后台依赖爬取失败: %s", e)
+        #
+        # threading.Thread(target=_bg_merge_deps, daemon=True, name="ws-deps-bg").start()
+        _log.info("[ws-deps] 启动全量爬取已禁用，依赖改为按需触发（点预览/启用时 fetch_mod_deps）")
 
-        threading.Thread(target=_bg_merge_deps, daemon=True, name="ws-deps-bg").start()
+        # 2026-11-07 v2 持久化回填：refresh 重建 _mods 后，把 workshop_deps.json 里的缓存
+        # 重新注入 manifest.dependencies（磁盘 mod.json 本来没写 deps，fetch_mod_deps 只写内存）
+        # v2 改动：加锁（防并发读写 JSON 损坏）+ 时间戳过期（7 天）+ 兼容老格式
+        try:
+            _cache_file = self.data_dir / "cache" / "workshop_deps.json"
+            if _cache_file.is_file():
+                with _DEPS_CACHE_LOCK:
+                    try:
+                        with open(_cache_file, 'r', encoding='utf-8') as _f:
+                            _cache = json.load(_f)
+                    except (json.JSONDecodeError, OSError):
+                        _log.warning("[ws-deps] 缓存文件损坏，跳过回填")
+                        _cache = {}
+                _restored = 0
+                for _mid, _info in self._mods.items():
+                    if not _info.workshop_id:
+                        continue  # 只回填工坊 mod（本地 mod 自己 mod.json 里应该有）
+                    if _info.manifest.dependencies:
+                        continue  # manifest 自带 deps 就不用覆盖
+                    _entry = _cache.get(str(_mid).lower())
+                    if not _entry:
+                        continue
+                    # 新格式：{"deps": [...], "updated_at": timestamp}
+                    if isinstance(_entry, dict):
+                        _ts = _entry.get("updated_at", 0)
+                        if time.time() - _ts > _DEPS_CACHE_TTL:
+                            continue  # 过期跳过，让 fetch_mod_deps 重爬
+                        _deps = _entry.get("deps")
+                        if _deps and isinstance(_deps, list):
+                            _info.manifest.dependencies = list(_deps)
+                            _restored += 1
+                    # 老格式兼容：只有数组没有时间戳 → 当作过期跳过
+                if _restored:
+                    _log.debug("[ws-deps] 从缓存回填 %d 个工坊 mod 的依赖", _restored)
+        except Exception as _e:
+            _log.warning("[ws-deps] 回填缓存失败: %s", _e)
 
         _log.info(
             "refresh 完成: 共 %d 个mod, 启用侧 %d, 停用侧 %d, errors=%d",
@@ -2606,7 +2740,7 @@ class ModManager:
                         try:
                             _shutil.rmtree(str(_orphan), ignore_errors=True)
                             _cleaned += 1
-                            _log.info("refresh: 清理孤儿目录: %s", _orphan.name)
+                            _log.debug("refresh: 清理孤儿目录: %s", _orphan.name)
                         except Exception:
                             pass
             if _cleaned:
@@ -2627,19 +2761,40 @@ class ModManager:
             for w in self._warnings:
                 _log.warning("  %s", w)
 
-        # ============================================================ last_activity 兜底
-        # 所有 mod 都要有一个 last_activity（老用户迁移 + 新扫描的 mod）
-        # 优先用 install_dir 的 mtime（作者更新时间），fallback 用当前时间
-        for low, info in self._mods.items():
-            if low not in self._state.last_activity:
-                fallback = 0
-                if info.install_dir and info.install_dir.is_dir():
-                    try:
-                        fallback = int(info.install_dir.stat().st_mtime)
-                    except OSError:
-                        pass
-                self._state.last_activity[low] = fallback if fallback > 0 else int(time.time())
-        # 顺手清理 state 里已不存在 mod 的 last_activity 记录
+        # ============================================================ last_activity 兜底 + 迁移
+        # 2026-11-05: key 从 mod_id.lower() 改成 bucket_key（mod_id.lower() + "::" + wid）
+        # 迁移策略：先一次性处理所有 low_key（去掉 "::wid" 后缀），
+        # 老 key 如果在 last_activity 里 → pop → 给所有 bucket_key（基础 + 派生）各拷一份。
+        # 然后兜底没值的 bucket_key（用 install_dir mtime / 当前时间）。
+        all_bks = list(self._mods.keys())
+        # Step A: 扫所有 unique low_key，批量迁移
+        for low_key in {bk.split("::")[0] for bk in all_bks}:
+            if low_key not in self._state.last_activity:
+                continue
+            old_val = self._state.last_activity.pop(low_key)
+            count = 0
+            if low_key in all_bks:
+                self._state.last_activity[low_key] = old_val
+                count += 1
+            for b in all_bks:
+                if b.startswith(low_key + "::"):
+                    self._state.last_activity[b] = old_val
+                    count += 1
+            _log.debug("refresh: last_activity 迁移 %s → %d 个 bucket_key (base=%s, derives=%d)",
+                       low_key, count, low_key in all_bks,
+                       sum(1 for b in all_bks if b.startswith(low_key + "::")))
+        # Step B: 兜底
+        for bk, info in self._mods.items():
+            if bk in self._state.last_activity:
+                continue
+            fallback = 0
+            if info.install_dir and info.install_dir.is_dir():
+                try:
+                    fallback = int(info.install_dir.stat().st_mtime)
+                except OSError:
+                    pass
+            self._state.last_activity[bk] = fallback if fallback > 0 else int(time.time())
+        # 清理 stale：last_activity 里不在 _mods 的 key
         stale = [k for k in self._state.last_activity if k not in self._mods]
         for k in stale:
             del self._state.last_activity[k]
@@ -2657,31 +2812,47 @@ class ModManager:
         self._cache_disabled_ids_set = None
 
     def ordered_enabled(self) -> list[ModInfo]:
+        """返回 canonical 级别启用列表（一个 mod_id 一条，按 enabled_order 排序）。
+
+        本函数只返回 canonical ModInfo，不展开物理副本。
+        同一 mod_id 多 workshop 副本（如两个 Watcher）在 _mods 里只存一个 canonical；
+        多副本展开由调用方通过 available_versions(mod_id) 从 _mod_versions 模糊匹配负责。
+
+        语义：一个 mod_id 在 enabled_order 里，代表「至少有一个副本启用」，
+        不是「所有副本启用」。副本级启停状态由 source_states + available_versions 配合判断。
+        """
         if self._cache_enabled_list is not None:
             return self._cache_enabled_list
         out: list[ModInfo] = []
-        seen: set[str] = set()
+        seen: set[int] = set()
         for mid in self._state.enabled_order:
-            info = self._mods.get(mid.lower())
-            if info and info.mod_id.lower() not in seen:
+            low = mid.lower()
+            info = self._mods.get(low)
+            if info is not None and id(info) not in seen:
                 out.append(info)
-                seen.add(info.mod_id.lower())
+                seen.add(id(info))
         self._cache_enabled_list = out
-        self._cache_enabled_ids_set = seen
+        self._cache_enabled_ids_set = {i.mod_id.lower() for i in out}
         return out
 
     def ordered_disabled(self) -> list[ModInfo]:
+        """返回 canonical 级别停用列表（一个 mod_id 一条，按 disabled_order 排序）。
+
+        语义同 ordered_enabled：canonical 级别，不展开物理副本。
+        多副本展开由 available_versions(mod_id) 负责。
+        """
         if self._cache_disabled_list is not None:
             return self._cache_disabled_list
         out: list[ModInfo] = []
-        seen: set[str] = set()
+        seen: set[int] = set()
         for mid in self._state.disabled_order:
-            info = self._mods.get(mid.lower())
-            if info and info.mod_id.lower() not in seen:
+            low = mid.lower()
+            info = self._mods.get(low)
+            if info is not None and id(info) not in seen:
                 out.append(info)
-                seen.add(info.mod_id.lower())
+                seen.add(id(info))
         self._cache_disabled_list = out
-        self._cache_disabled_ids_set = seen
+        self._cache_disabled_ids_set = {i.mod_id.lower() for i in out}
         return out
 
     # ---- O2: 便捷访问器，避免 _check_all_dependencies 等热点方法自己重建 set ----
@@ -2698,12 +2869,78 @@ class ModManager:
 
     # ------------------------------------------------------ version selection --
 
-    def available_versions(self, mod_id: str) -> list[ModInfo]:
-        """返回该 mod 的全部物理副本（工坊/本地/停用），供「切换版本」菜单使用。"""
-        return list(self._mod_versions.get(mod_id.lower(), []))
+    @staticmethod
+    def _bucket_key(mod_id: str, workshop_id: Optional[Any] = None) -> str:
+        """_mod_versions 桶 key 生成器。
 
-    def active_version(self, mod_id: str) -> Optional[ModInfo]:
-        return self._mods.get(mod_id.lower())
+        - 有 workshop_id（数字字符串）→ 派生 key：mid_lower + "::" + wid
+          让两个不同 Steam 工坊但 manifest mod_id 撞名（如 boninall 的 "Watcher" 3747526116
+          vs lamali292 的 "The Watcher" 3747492505）各自独立入桶，不合并。
+        - 无 workshop_id（local/disabled 副本）→ 基础 key：mid_lower，
+          保持旧行为（兼容 profile.json 和 source_states，本地副本身份稳定）。
+        - workshop_id 为 None 或非数字 → 也走基础 key（极端容错）。
+        """
+        low = str(mod_id).lower()
+        if workshop_id is not None:
+            s = str(workshop_id)
+            if s.isdigit():
+                return f"{low}::{s}"
+        return low
+
+    def available_versions(self, mod_id: str, workshop_id: Optional[Any] = None) -> list[ModInfo]:
+        """返回该 mod 的全部物理副本（工坊/本地/停用），供「切换版本」菜单使用。
+
+        workshop_id=None → 模糊匹配：扫所有 mid_lower + "::" 派生桶 + 基础桶，合并返回
+        （保持旧语义：同 mod_id 的所有副本一起返回）。
+        workshop_id=值 → 精确命中：只返回 bucket_key(mod_id, workshop_id) 桶里的副本
+        （让两个不同 workshop 撞 mod_id 的场景各自独立返回，不再串线）。
+        """
+        mid = str(mod_id).lower()
+
+        def _dedup(versions: list[ModInfo]) -> list[ModInfo]:
+            out: list[ModInfo] = []
+            seen: set[str] = set()
+            for v in versions:
+                vk = mod_version_key(v)
+                if vk in seen:
+                    continue
+                seen.add(vk)
+                out.append(v)
+            return out
+
+        exact = self._bucket_key(mid, workshop_id)
+        if workshop_id is not None and exact in self._mod_versions:
+            return _dedup(self._mod_versions[exact])
+        # 没精确命中（或调用方没传 workshop_id）→ 模糊匹配同 mod_id 的所有桶
+        result: list[ModInfo] = []
+        for key, versions in self._mod_versions.items():
+            if key == mid or key.startswith(mid + "::"):
+                result.extend(versions)
+        # 稳定排序：按 mod_version_key 字典序，保证每次 refresh 后展开顺序一致
+        # mod_version_key = install_dir#mod_id.lower()，合集工坊同目录多 manifest 内部也能区分
+        # （单纯按 install_dir 排序会让合集工坊全部相等，退化成原列表插入顺序）
+        result.sort(key=mod_version_key)
+        return _dedup(result)
+
+    def active_version(self, mod_id: str, workshop_id: Optional[Any] = None) -> Optional[ModInfo]:
+        """返回该 mod 的 canonical 物理副本（install_dir 存在的那个）。
+
+        workshop_id=None → 按基础 key + 派生桶找（兼容多 workshop 撞名）
+        workshop_id=值 → 精确命中 bucket_key(mod_id, workshop_id)
+        """
+        mid = str(mod_id).lower()
+        if workshop_id is not None:
+            exact = self._bucket_key(mid, workshop_id)
+            if exact in self._mods:
+                return self._mods[exact]
+        # 先试基础 key
+        if mid in self._mods:
+            return self._mods[mid]
+        # 再扫派生桶（取第一个有 install_dir 的）
+        for key, info in self._mods.items():
+            if key.startswith(mid + "::") and info.install_dir:
+                return info
+        return None
 
     def highest_version(self, mod_id: str) -> Optional[str]:
         """该 mod 全部副本中的最高版本号；没有版本号则返回 None。"""
@@ -2784,7 +3021,7 @@ class ModManager:
                 except Exception:
                     ok_in_mods = False
                 if not ok_in_mods:
-                    _log.info("[bmm_reconcile] BMM 要求启用 Workshop mod %s，install_dir=%s 不在 Mods/ → 补种 stub", info.mod_id, info.install_dir)
+                    _log.debug("[bmm_reconcile] BMM 要求启用 Workshop mod %s，install_dir=%s 不在 Mods/ → 补种 stub", info.mod_id, info.install_dir)
                     try:
                         new_info = ensure_workshop_stub_enabled(info, self._game)
                         self._mods[low] = new_info
@@ -2795,7 +3032,7 @@ class ModManager:
             else:
                 # Local 类：物理在 .mods_disabled/ 才搬回
                 if info.source == "disabled":
-                    _log.info("[bmm_reconcile] BMM 要求启用 Local mod %s，当前在 disabled 目录 → 搬回 Mods/", info.mod_id)
+                    _log.debug("[bmm_reconcile] BMM 要求启用 Local mod %s，当前在 disabled 目录 → 搬回 Mods/", info.mod_id)
                     try:
                         new_info = move_mod_between(info, self._game.mods_dir, target_source="local")
                         self._mods[low] = new_info
@@ -2825,7 +3062,7 @@ class ModManager:
                 except Exception:
                     in_mods = False
                 if in_mods:
-                    _log.info("[bmm_reconcile] BMM 要求停用 Workshop mod %s，install_dir=%s 仍在 Mods/ → stub 搬去 .mods_disabled/", info.mod_id, info.install_dir)
+                    _log.debug("[bmm_reconcile] BMM 要求停用 Workshop mod %s，install_dir=%s 仍在 Mods/ → stub 搬去 .mods_disabled/", info.mod_id, info.install_dir)
                     try:
                         new_info = ensure_workshop_stub_disabled(info, self._game)
                         self._mods[low] = new_info
@@ -2842,7 +3079,7 @@ class ModManager:
             else:
                 # Local 类：物理在 local/Mods/ 下 → 搬去 .mods_disabled/
                 if info.source == "local":
-                    _log.info("[bmm_reconcile] BMM 要求停用 Local mod %s，当前在 Mods/ → 搬去 .mods_disabled/", info.mod_id)
+                    _log.debug("[bmm_reconcile] BMM 要求停用 Local mod %s，当前在 Mods/ → 搬去 .mods_disabled/", info.mod_id)
                     try:
                         new_info = move_mod_between(info, self._game.disabled_dir, target_source="disabled")
                         self._mods[low] = new_info
@@ -2870,7 +3107,7 @@ class ModManager:
                 workshop_url=workshop_url,
             )
             dirty_bmm = True
-            _log.info("[bmm_reconcile] 3) mod=%s BMM 未记录 → 按物理位置(source=%s)写回 Enabled=%s",
+            _log.debug("[bmm_reconcile] 3) mod=%s BMM 未记录 → 按物理位置(source=%s)写回 Enabled=%s",
                       info.mod_id, info.source, phys_enable)
             processed.add(low)
 
@@ -2937,14 +3174,15 @@ class ModManager:
                 low = info.mod_id.lower()
                 is_ws_mod = bool(info.workshop_id) or info.source == "workshop"
                 if is_ws_mod:
-                    # 2a) profile.json 的 _source_states 优先（用户在管理器里明确停过这个物理副本）
-                    ss = self._source_states.get(low, {})
-                    state_key = mod_version_key(info)
-                    if state_key in ss:
-                        classification[low] = "disabled" if ss[state_key] is False else "enabled"
-                        continue
-                    # 2b) 再看 settings.save 里的 is_enabled（兼容老数据）
-                    classification[low] = nat_class.get(low, "enabled")
+                    # 2026-11-06 重构：多副本 canonical 聚合（同 L2512 phys_disabled_lower 逻辑）
+                    # 旧代码只查 canonical info 的 bucket_key，同 mod_id 多 workshop 时完全忽略其他副本
+                    # → watcher 一个副本启用（wid=3747526116 state=True）、另一个停用
+                    #    → 旧代码只看 canonical info（wid=3747492505）→ 把整个 watcher 归停用侧
+                    # 新逻辑：任何一个副本 _copy_baseline_enabled → canonical 算启用侧
+                    classification[low] = "enabled" if any(
+                        self._copy_baseline_enabled(v)
+                        for v in self.available_versions(low)
+                    ) else "disabled"
                 else:
                     classification[low] = "disabled" if info.source == "disabled" else "enabled"
         elif self.uses_better_mod_menu:
@@ -3081,7 +3319,7 @@ class ModManager:
 
         mid_lower = info.mod_id.lower()
         occupant: Optional[ModInfo] = None
-        for v in self._mod_versions.get(mid_lower, []):
+        for v in self.available_versions(mid_lower):
             if v.source == "local" and str(v.install_dir) == str(target_mods):
                 occupant = v
                 break
@@ -3092,8 +3330,6 @@ class ModManager:
             return None, info
 
         _orig_occupant_dir = str(occupant.install_dir)
-        # 2026-11-01 多副本修复：workshop 副本用 ws_{workshop_id} 唯一 key
-        _orig_occupant_state_key = f"ws_{occupant.workshop_id}" if occupant.workshop_id else occupant.source
 
         _log.info("[set_enabled] 抢占检测: Mods/%s 被同 mod_id 的另一份副本占着（source=%s）",
                   info.folder_name, occupant.source)
@@ -3109,11 +3345,11 @@ class ModManager:
                 # === 三步原子交换 ===
                 backup_dir = disabled_dir / f"{info.folder_name}.swap-{int(_time.time())}"
                 _os.replace(str(info.install_dir), str(backup_dir))
-                _log.info("[set_enabled] 抢占交换 step1: 暂存 info 到 %s", backup_dir)
+                _log.debug("[set_enabled] 抢占交换 step1: 暂存 info 到 %s", backup_dir)
                 _os.replace(str(target_mods), str(info.install_dir))
-                _log.info("[set_enabled] 抢占交换 step2: occupant 搬去 %s", info.install_dir)
+                _log.debug("[set_enabled] 抢占交换 step2: occupant 搬去 %s", info.install_dir)
                 _os.replace(str(backup_dir), str(target_mods))
-                _log.info("[set_enabled] 抢占交换 step3: info 搬去 %s", target_mods)
+                _log.debug("[set_enabled] 抢占交换 step3: info 搬去 %s", target_mods)
 
                 occupant_new = ModInfo(
                     manifest=occupant.manifest,
@@ -3137,18 +3373,30 @@ class ModManager:
             raise
 
         # 更新 _mod_versions 里的 occupant 条目
-        for i, v in enumerate(self._mod_versions.get(mid_lower, [])):
-            if str(v.install_dir) == _orig_occupant_dir:
-                self._mod_versions[mid_lower][i] = occupant_new
-                break
+        # 2026-11-05: occupant 可能在派生桶里（不同 workshop 撞名场景），不能只查基础桶
+        _orig = str(_orig_occupant_dir)
+        for bk, _versions in self._mod_versions.items():
+            if bk != mid_lower and not bk.startswith(mid_lower + "::"):
+                continue
+            for _i, v in enumerate(_versions):
+                if str(v.install_dir) == _orig:
+                    self._mod_versions[bk][_i] = occupant_new
+                    break
+            else:
+                continue
+            break
 
         cur_main = self._mods.get(mid_lower)
         if cur_main and str(cur_main.install_dir) == _orig_occupant_dir:
             self._mods[mid_lower] = occupant_new
 
         # occupant 的 source_states = False
-        self._source_states.setdefault(mid_lower, {})[_orig_occupant_state_key] = False
-        self._source_last_toggled.setdefault(mid_lower, {})[_orig_occupant_state_key] = _time.time()
+        # key 必须用搬目录之后重算的 mod_version_key（= 当前 install_dir），
+        # 与读取侧（_all_versions_dict / commit_changes / ordered_enabled）一致
+        _occupant_state_key = mod_version_key(occupant_new)
+        occupant_bk = self._bucket_key(occupant_new.mod_id, occupant_new.workshop_id)
+        self._source_states.setdefault(occupant_bk, {})[_occupant_state_key] = False
+        self._source_last_toggled.setdefault(mid_lower, {})[_occupant_state_key] = _time.time()
 
         _log.info("[set_enabled] 抢占完成: occupant→%s(disabled), info→%s(local)",
                   occupant_new.install_dir, new_info.install_dir)
@@ -3166,7 +3414,7 @@ class ModManager:
         if source is None:
             return self._mods.get(low)
         target_enum = norm_mod_source(source)
-        for v in self._mod_versions.get(low, []):
+        for v in self.available_versions(low):
             if norm_mod_source(v.source) == target_enum:
                 return v
         return self._mods.get(low)
@@ -3183,17 +3431,22 @@ class ModManager:
                     return v
         return None
 
-    def _touch_activity(self, mod_id: str) -> None:
+    def _touch_activity(self, mod_id: str, workshop_id: Optional[Any] = None) -> None:
         """更新 mod 的最近活动时间为当前时间（秒级 Unix ts）。
-        用于停用列表按"最近操作"排序。"""
-        self._state.last_activity[mod_id.lower()] = int(time.time())
+        用于停用列表按"最近操作"排序。
 
-    def _ensure_activity(self, mod_id: str, fallback_ts: int = 0) -> None:
+        2026-11-05: 用 bucket_key 做 key，让不同 workshop 撞 mod_id 的副本各自独立记录。
+        """
+        bk = self._bucket_key(mod_id, workshop_id)
+        self._state.last_activity[bk] = int(time.time())
+
+    def _ensure_activity(self, mod_id: str, fallback_ts: int = 0,
+                         workshop_id: Optional[Any] = None) -> None:
         """如果 mod 还没 last_activity，设一个默认值。
         迁移老用户 + 扫描新 mod 时用，避免大量 mod 挤在一起。"""
-        low = mod_id.lower()
-        if low not in self._state.last_activity:
-            self._state.last_activity[low] = fallback_ts if fallback_ts > 0 else int(time.time())
+        bk = self._bucket_key(mod_id, workshop_id)
+        if bk not in self._state.last_activity:
+            self._state.last_activity[bk] = fallback_ts if fallback_ts > 0 else int(time.time())
 
     @_serialized
     def delete_mod(self, mod_id: str, version_key: Optional[str] = None) -> bool:
@@ -3213,8 +3466,8 @@ class ModManager:
         target_dir = None
         if version_key:
             # 从 _mod_versions 里找匹配的副本
-            for v in self._mod_versions.get(low, []):
-                if v.install_dir and str(v.install_dir) == version_key:
+            for v in self.available_versions(low):
+                if mod_version_key(v) == version_key:
                     target_dir = v.install_dir
                     break
             if target_dir is None:
@@ -3238,7 +3491,7 @@ class ModManager:
 
         # ----- 从内存移除 -----
         # 如果这是最后一个版本 → 清理 canonical
-        remaining = [v for v in self._mod_versions.get(low, [])
+        remaining = [v for v in self.available_versions(low)
                      if v.install_dir and Path(str(v.install_dir)) != target_dir]
         if not remaining:
             self._mods.pop(low, None)
@@ -3248,19 +3501,411 @@ class ModManager:
             self._source_states.pop(low, None)
             self._source_last_toggled.pop(low, None)
         else:
-            # 还有其他副本 → 更新 canonical install_dir 指向剩余第一个版本
-            self._mod_versions[low] = remaining
-            info.install_dir = remaining[0].install_dir
-            info.source = remaining[0].source
-            # 从 source_states 里删除被删副本对应的 key（2026-11-04: key 已改成 version_key）
-            srcs = self._source_states.get(low, {})
-            srcs.pop(mod_version_key(info), None)
+            # 还有其他副本 → 清理空桶 + 更新剩余副本
+            # 2026-11-05: 删除的副本可能在派生桶里，先从那个桶里移除 target_dir
+            remaining = []
+            for bk in list(self._mod_versions.keys()):
+                if bk != low and not bk.startswith(low + "::"):
+                    continue
+                vs = self._mod_versions[bk]
+                self._mod_versions[bk] = [
+                    v for v in vs
+                    if not (v.install_dir and Path(str(v.install_dir)) == target_dir)
+                ]
+                if self._mod_versions[bk]:
+                    remaining.extend(self._mod_versions[bk])
+                else:
+                    self._mod_versions.pop(bk, None)
+            if remaining:
+                info.install_dir = remaining[0].install_dir
+                info.source = remaining[0].source
+            # 从 source_states 里删除被删副本对应的 key（2026-11-06: outer key 也用 bucket_key）
+            # 删除后剩余的副本可能换了 outer key（从派生桶变成基础桶，或反之）
+            remaining_bks = {self._bucket_key(v.mod_id, v.workshop_id) for v in remaining}
+            # 先从所有 outer key 里 pop inner key（outer key 可能已经不存在了）
+            srcs_removed = False
+            for ss_bk in list(self._source_states.keys()):
+                ss_inner = self._source_states[ss_bk]
+                old_vk_in_outer = str(target_dir)
+                # 2026-11-06: 用 mod_version_key 匹配而不是 str(target_dir)
+                for v in versions:
+                    if str(v.install_dir) == str(target_dir):
+                        old_vk_in_outer = mod_version_key(v)
+                        break
+                if old_vk_in_outer in ss_inner:
+                    srcs_removed = True
+                    ss_inner.pop(old_vk_in_outer, None)
+                    if not ss_inner and ss_bk not in remaining_bks:
+                        self._source_states.pop(ss_bk, None)
 
         self._invalidate_mod_caches()
         self.save_state()
         _log.info("[delete_mod] 已删除 mod=%s 目录=%s (剩余版本=%d)",
                   info.mod_id, target_dir, len(remaining))
         return True
+
+    # ---------------------------------------------------------------------
+    # 延迟保存：前端 toggle 时同步后端内存（不写盘、不搬目录）
+    # ---------------------------------------------------------------------
+    @_serialized
+    def apply_frontend_delta(
+        self,
+        desired_enabled_order: list[str],
+        desired_disabled_order: list[str],
+        copy_delta: Optional[dict] = None,
+    ) -> dict:
+        """前端每次 toggle 后调，只同步后端内存状态。
+        不搬目录、不写 settings.save、不写 profile.json —— 这些等 commit_changes。
+        目的：让任何需要读后端状态的功能（工坊检查、启动前预校验）拿到最新值。
+        """
+        try:
+            # 1. 更新 _state.enabled_order / disabled_order（canonical 粒度）
+            self._state.enabled_order = list(desired_enabled_order)
+            self._state.disabled_order = list(desired_disabled_order)
+
+            # 1.5 累积副本级意图（单副本 delta，后写覆盖前写，天然幂等）
+            if copy_delta:
+                _vk = copy_delta.get('version_key') or ''
+                _mid = (copy_delta.get('mod_id') or '').lower()
+                if _vk and _mid:
+                    _bk = self._bucket_key(_mid, copy_delta.get('workshop_id'))
+                    self._desired_copy_states.setdefault(_bk, {})[_vk] = bool(
+                        copy_delta.get('is_enabled')
+                    )
+
+            # 2. 更新 _source_states —— 不在这里写！
+            #    apply_frontend_delta 是前端视图层同步，_source_states 是持久化层状态
+            #    提前写了会污染 commit_changes 的 diff（will_enable == source_states 永远成立）
+            #    _source_states 的写入完全由 _set_enabled_inner 在 commit_changes 里负责
+            #    commit_changes 用 _source_states 做 persisted vs desired 的 diff 基准
+
+            # 3. 更新 _native_full_data（settings.save 内存里的 is_enabled）
+            #    只改 canonical 粒度的 is_enabled，保持顺序和其他字段不变
+            if self._native_full_data is not None:
+                native_order = self._native_full_data.get('enabled_mods', [])
+                # 构建快速查找表
+                mid_to_enabled = {}
+                for m in desired_enabled_order:
+                    mid_to_enabled[m.lower()] = True
+                for m in desired_disabled_order:
+                    mid_to_enabled[m.lower()] = False
+
+                for entry in native_order:
+                    mid = (entry.get('mod_id') or entry.get('id') or '').lower()
+                    if mid in mid_to_enabled:
+                        entry['is_enabled'] = mid_to_enabled[mid]
+
+            _log.info("[apply_frontend_delta] enabled=%d disabled=%d",
+                      len(desired_enabled_order), len(desired_disabled_order))
+
+            return {'ok': True}
+        except Exception as e:
+            _log.error("[apply_frontend_delta] 失败: %s", e, exc_info=True)
+            return {'ok': False, 'error': str(e)}
+
+    # ---------------------------------------------------------------------
+    # 延迟保存：原子化 commit 所有前端攒的启停变更
+    # ---------------------------------------------------------------------
+    def _copy_baseline_enabled(self, v) -> bool:
+        """副本级启用基线：source_states → settings.save → 物理位置。
+
+        与 refresh 的 _is_disabled_side 保持同一权威顺序：
+          1) profile.json 的 _source_states（bucket_key + version_key，用户权威）
+          2) settings.save 的 mod_list（工坊 mod 物理恒启用，游戏侧权威）
+          3) 本地 mod 物理位置（source == 'disabled' 即停用）
+        UI 投影（api._all_versions_dict）与 commit_changes 互斥必须共用本方法，
+        否则会出现「界面显示启用、保存却按停用基线处理」的矛盾。
+        """
+        bk = self._bucket_key(v.mod_id, v.workshop_id)
+        ss = self._source_states.get(bk, {})
+        vk = mod_version_key(v)
+        if vk in ss:
+            return bool(ss[vk])
+        if v.workshop_id or v.source == "workshop":
+            data = self._native_full_data or {}
+            # 与 refresh 的 _is_disabled_side 完全一致：只有该 mod_id 的所有 source
+            # 条目都 is_enabled=false 才算停用侧（见 nat_extract_disabled_order_ids）
+            disabled_lower = {m.lower() for m in nat_extract_disabled_order_ids(data)}
+            return v.mod_id.lower() not in disabled_lower
+        return v.source != "disabled"
+
+    @_serialized
+    def commit_changes(
+        self,
+        desired_enabled_order: list[str],
+        desired_disabled_order: list[str],
+        copy_states: Optional[list[dict]] = None,
+        just_touched_list: Optional[list[dict]] = None,
+    ) -> dict:
+        """原子化提交前端纯改 state 攒的所有启停变更。
+
+        不依赖前端传 source_states——后端重新扫 _mod_versions 里所有物理副本，
+        对比 desired_enabled / desired_disabled 算出每个副本该在哪侧，
+        差异搬目录 + 改内存 + 统一写盘。
+
+        复用现有 _set_enabled_inner(auto_save=False) 处理物理层搬目录 + 内存同步，
+        最后统一 save_state() + _do_save_native_mod_list() + _do_save_bmm_settings()。
+
+        返回: {'ok': True/False, 'errors': [...], 'committed': [...]}
+        """
+        errors: list[str] = []
+        committed: list[str] = []
+
+        if not desired_enabled_order and not desired_disabled_order and not copy_states and not just_touched_list:
+            _log.warning("[commit_changes] 前端传空列表，跳过")
+            return {'ok': True, 'errors': errors, 'committed': committed}
+
+        # ====== Step 1: 给每个副本算 desired_side ======
+        # desired_enabled 里的都是 mod_id（去重后），同 mod_id 可能有多个副本
+        # commit_changes 内部会做互斥：同 mod_id 的 local/disabled 副本只留一个在 enabled
+        # 统一转小写：前端传的是 manifest 原始 id（如 OrchisNecrobinderSkinMod），
+        # 下面一律用 mod_id.lower() 比对；不转小写会让 camelCase 的 mod 被误判成 desired=False → 保存后被停用
+        desired_enabled_set = {m.lower() for m in desired_enabled_order}
+        desired_disabled_set = {m.lower() for m in desired_disabled_order}
+
+        # ====== Step 1.5: 副本级意图（优先级最高） ======
+        # 同一 mod_id 可能同时存在多个工坊/本地副本，canonical 粒度无法表达
+        # 「只启用其中一个副本」；前端 toggle 时已把副本级 delta 攒进
+        # _desired_copy_states。这里与本次 save 传上来的 copy_states 合并，
+        # 后者覆盖前者（同一轮后写为准）。格式：{bucket_key: {version_key: bool}}
+        copy_intent: dict[str, dict[str, bool]] = {}
+        for bk, states in self._desired_copy_states.items():
+            copy_intent[bk] = dict(states)
+        for entry in (copy_states or []):
+            if not isinstance(entry, dict):
+                continue
+            vk = entry.get('version_key') or ''
+            mid = (entry.get('mod_id') or '').lower()
+            if not vk or not mid:
+                continue
+            bk = self._bucket_key(mid, entry.get('workshop_id'))
+            copy_intent.setdefault(bk, {})[vk] = bool(entry.get('enabled'))
+
+        def _copy_want(v) -> Optional[bool]:
+            """返回该副本的显式意图；None 表示前端没给副本级意图。"""
+            bk = self._bucket_key(v.mod_id, v.workshop_id)
+            return copy_intent.get(bk, {}).get(mod_version_key(v))
+
+        def _final_want(v) -> bool:
+            """该副本本次保存后的期望状态：副本意图 → source_states 保持现状 → canonical fallback → 主副本覆盖。
+
+            核心原则：**副本级意图优先，没碰过的副本保持现状；但主副本（workshop/local非disabled）
+            不应被 source_states 的旧 False 阻止启用——如果 canonical 层面说这个 mod 应该启，
+            且前端没给副本级意图（copy_states 空），主副本就启。**
+            """
+            # 1) 副本级意图（copy_states / just_touched_list）
+            w = _copy_want(v)
+            if w is not None:
+                return w
+
+            _bk = self._bucket_key(v.mod_id, v.workshop_id)
+            _vk = mod_version_key(v)
+            _ss_inner = self._source_states.get(_bk, {})
+            _ss_val = _ss_inner.get(_vk, None)
+            mid_lower = v.mod_id.lower()
+
+            # 2) 如果前端没给副本级意图（copy_intent 对这个 bucket_key 为空），
+            #    且 canonical 层面说这个 mod 应该启用，
+            #    且当前是"主副本"→ 覆盖 source_states 旧 False，启它
+            _has_any_intent = bool(copy_intent)
+            _is_master = ('::' in _bk) or (v.source != 'disabled')  # workshop 总是主；local 非 disabled 也是主
+            if not _has_any_intent and mid_lower in desired_enabled_set and _is_master:
+                return True
+
+            # 3) source_states 有记录 → 保持现状
+            if _ss_val is not None:
+                return bool(_ss_val)
+
+            # 4) source_states 没记录 → canonical fallback
+            if mid_lower in desired_enabled_set:
+                return True
+            if mid_lower in desired_disabled_set:
+                return False
+
+            # 5) 兜底：按 source != 'disabled' 判断
+            return (v.source or 'local') != 'disabled'
+
+        # 遍历顺序不影响最终排序了——commit 结束后会统一校正 source_last_toggled
+        mid_versions: dict[str, dict[str, object]] = {}
+        for _versions in self._mod_versions.values():
+            for v in _versions:
+                mid_versions.setdefault(v.mod_id.lower(), {})[mod_version_key(v)] = v
+
+        # ====== Step 2.5: 构建 touched_set + 遍历执行差异 ======
+        touched_set: set[tuple] = set()   # (bucket_key, version_key)
+        for item in (just_touched_list or []):
+            _tmid = (item.get("mod_id") or "").lower()
+            _twid = item.get("workshop_id")
+            _tvk = item.get("version_key") or ""
+            if _tmid and _tvk:
+                _tbk = self._bucket_key(_tmid, _twid)
+                touched_set.add((_tbk, _tvk))
+                touched_set.add((_tmid, _tvk))  # 兼容纯 mid_lower 形式
+
+        # ====== Step 3: 逐个副本独立执行差异 ======
+        # 分类统计（给前端友好提示用）
+        stats = {"enabled_success": 0, "enabled_fail": 0, "disabled_success": 0, "disabled_fail": 0, "fail_details": []}
+        total_diffs = 0  # 有多少副本需要实际操作（diff=True）
+        for mid_lower, versions_map in mid_versions.items():
+            for v in versions_map.values():
+                vk = mod_version_key(v)
+                mod_id = v.mod_id
+
+                # 优先级：副本级意图 → canonical → 两侧都不在则保持现状
+                will_enable = _final_want(v)
+
+                # ====== Diff: 统一用 source_states 做基准 + touched 强制 ======
+                _bucket = self._bucket_key(v.mod_id, v.workshop_id)
+                _is_touched = (_bucket, vk) in touched_set or (mid_lower, vk) in touched_set
+
+                ss = self._source_states.get(_bucket, {})
+                current_enabled = ss.get(vk, None)
+                if _is_touched:
+                    # 用户碰过的副本：强制 diff=True（不管 source_states 基线）
+                    # 覆盖盲区 2: 启用→停用 source_states 本来就是 False → 强制调 _set_enabled_inner
+                    diff = True
+                elif current_enabled is None:
+                    # source_states 里没记录：第一次遇到这个 mod → 必须调一次写入
+                    diff = True
+                else:
+                    diff = (will_enable != current_enabled)
+
+                if not diff:
+                    continue
+                total_diffs += 1
+
+                # workshop 副本：不搬目录，但改 source_states + _native_full_data（通过 _set_enabled_inner）
+                # local/disabled 副本：搬目录 + 改内存
+                try:
+                    ok, _ = self._set_enabled_inner(
+                        mod_id, will_enable, old_version_key=vk, auto_save=False,
+                    )
+                    if ok:
+                        committed.append(f"{mod_id} → {'enabled' if will_enable else 'disabled'}")
+                        if will_enable:
+                            stats["enabled_success"] += 1
+                        else:
+                            stats["disabled_success"] += 1
+                        _log.debug("[commit_changes] %s → enable=%s (vk=%s)", mod_id, will_enable, vk)
+                    else:
+                        err_msg = f"{mod_id} 启用/停用失败"
+                        errors.append(err_msg)
+                        if will_enable:
+                            stats["enabled_fail"] += 1
+                        else:
+                            stats["disabled_fail"] += 1
+                        stats["fail_details"].append({"mod": mod_id, "action": "enable" if will_enable else "disable", "reason": "内部失败"})
+                except Exception as e:
+                    err_msg = f"{mod_id} 异常: {e}"
+                    errors.append(err_msg)
+                    if will_enable:
+                        stats["enabled_fail"] += 1
+                    else:
+                        stats["disabled_fail"] += 1
+                    # WinError 32 文件占用 → 友好提示
+                    reason = str(e)
+                    if "WinError 32" in reason or "进程正在使用" in reason or "being used by another process" in reason.lower():
+                        reason = "文件被占用（游戏或其他进程正在使用该模组的 DLL）"
+                    stats["fail_details"].append({"mod": mod_id, "action": "enable" if will_enable else "disable", "reason": reason})
+                    _log.exception("[commit_changes] %s 异常", mod_id)
+
+        # ====== Step 4: 更新 _state.enabled_order / disabled_order ======
+        # 前端传的 canonical mod_id 顺序就是最终顺序——直接按 desired_*_set 分流，不加任何 source_states 过滤
+        # （多副本场景下 source_states 是副本级别的，不该拿来过滤 canonical 列表）
+        new_enabled: list[str] = []
+        new_disabled: list[str] = []
+        en_seen: set[str] = set()
+        dis_seen: set[str] = set()
+
+        for mid in desired_enabled_order:
+            mid_l = mid.lower()
+            if mid_l in en_seen:
+                continue
+            en_seen.add(mid_l)
+            # 用 _mods 里的 canonical 大小写（前端可能传了别名）
+            canonical = mid_l
+            info = self._mods.get(mid_l)
+            if info is not None:
+                canonical = info.mod_id
+            new_enabled.append(canonical)
+
+        for mid in desired_disabled_order:
+            mid_l = mid.lower()
+            if mid_l in dis_seen or mid_l in en_seen:
+                continue  # 已在 enabled 里就别重复
+            dis_seen.add(mid_l)
+            canonical = mid_l
+            info = self._mods.get(mid_l)
+            if info is not None:
+                canonical = info.mod_id
+            new_disabled.append(canonical)
+
+        self._state.enabled_order = new_enabled
+        self._state.disabled_order = new_disabled
+        self._invalidate_mod_caches()
+
+        # ====== Step 5: 时间戳（纯元数据，不参与排序了）======
+        # 2026-11-07 纯数组方案：disabled_at 只记录"什么时候停用的"，
+        # 排序完全靠 state.disabled 数组自身顺序（toggleFrontend unshift → 顶部）
+        now = time.time()
+        if just_touched_list:
+            for item in just_touched_list:
+                _tmid = (item.get("mod_id") or "").lower()
+                _twid = item.get("workshop_id")
+                _tvk = item.get("version_key") or ""
+                _bk = self._bucket_key(_tmid, _twid)
+                if _tmid in desired_enabled_set:
+                    # 最终在 enabled → 写 enabled_at + 清 disabled_at
+                    self._source_enabled_at.setdefault(_bk, {})[_tvk] = now
+                    self._source_last_toggled.setdefault(_tmid, {})[_tvk] = now
+                    if _bk in self._source_disabled_at:
+                        self._source_disabled_at[_bk].pop(_tvk, None)
+                        if not self._source_disabled_at[_bk]:
+                            del self._source_disabled_at[_bk]
+                else:
+                    # 最终在 disabled → 写 disabled_at（纯时间元数据）
+                    self._source_disabled_at.setdefault(_bk, {})[_tvk] = now
+                    self._source_last_toggled.setdefault(_tmid, {})[_tvk] = now
+        else:
+            # 向后兼容：just_touched_list=None（老前端不传）→ 跳过，不做时间戳写入
+            # （老前端不传这个参数）
+            for mod_id in desired_disabled_order:
+                mid_lower = mod_id.lower()
+                for v in self.available_versions(mid_lower):
+                    vk = mod_version_key(v)
+                    _bk = self._bucket_key(v.mod_id, v.workshop_id)
+                    self._source_last_toggled.setdefault(mid_lower, {})[vk] = now
+                    self._source_disabled_at.setdefault(_bk, {})[vk] = now
+            for mod_id in desired_enabled_order:
+                mid_lower = mod_id.lower()
+                for v in self.available_versions(mid_lower):
+                    vk = mod_version_key(v)
+                    _bk = self._bucket_key(v.mod_id, v.workshop_id)
+                    self._source_last_toggled.setdefault(mid_lower, {})[vk] = now
+                    self._source_enabled_at.setdefault(_bk, {})[vk] = now
+
+        # ====== Step 6: 统一写盘 ======
+        self.save_state()  # profile.json（含 enabled_order / disabled_order / source_states）
+        if self.uses_native_mod_list:
+            self._do_save_native_mod_list()  # settings.save（游戏原生 is_enabled）
+        if self.uses_better_mod_menu:
+            self._do_save_bmm_settings()
+
+        # 成功后清空前端副本级意图；失败保留，下次保存可重试
+        if not errors:
+            self._desired_copy_states = {}
+
+        _log.info("[commit_changes] 完成: committed=%d, errors=%d", len(committed), len(errors))
+        has_success = len(committed) > 0
+        has_fail = len(errors) > 0
+        return {
+            'ok': True,                    # 只要没 errors 就算 ok（部分成功 / 无变更都 ok）
+            'no_op': not has_fail and total_diffs == 0,  # 无变更：没有副本需要任何操作
+            'all_ok': not has_fail,        # 全成功才是 all_ok
+            'errors': errors,
+            'committed': committed,
+            'stats': stats,
+        }
 
     # ---------------------------------------------------------------------
     # 游戏原生排序：Kahn 拓扑 + PriorityQueue 平级（1:1 复刻 ModManager.SortModList）
@@ -3487,7 +4132,7 @@ class ModManager:
             return ok
         else:
             # 批量模式
-            versions = list(self._mod_versions.get(mod_id.lower(), []))
+            versions = list(self.available_versions(mod_id))
             if not versions:
                 _log.warning("[set_enabled 批量] mod_id=%s 无物理副本 → 跳过", mod_id)
                 return False
@@ -3517,7 +4162,7 @@ class ModManager:
         物理层搬目录后已更新 → 直接用它跳过，不会漏也不会错。
         """
         mid_lower = mod_id.lower()
-        versions = list(self._mod_versions.get(mid_lower, []))
+        versions = list(self.available_versions(mid_lower))
         excluded = 0
         for v in versions:
             vk = mod_version_key(v)
@@ -3526,31 +4171,42 @@ class ModManager:
             if v.workshop_id:
                 continue  # workshop 副本不参与互斥
             # 其他 local/disabled 副本 → 强制停用
-            _log.info("[互斥] 自动停用同 mod_id 其他副本: %s (vk=%s)", v.mod_id, vk)
-            _, _ = self._set_enabled_inner(mod_id, False, version_key=vk, auto_save=False)
+            _log.debug("[互斥] 自动停用同 mod_id 其他副本: %s (vk=%s)", v.mod_id, vk)
+            _, _ = self._set_enabled_inner(mod_id, False, old_version_key=vk, auto_save=False)
             excluded += 1
         if excluded:
-            _log.info("[互斥] %s 停用 %d 个同 mod_id 其他副本", mod_id, excluded)
+            _log.debug("[互斥] %s 停用 %d 个同 mod_id 其他副本", mod_id, excluded)
             if auto_save:
                 self.save_state()
 
     def _set_enabled_inner(
         self, mod_id: str, enable: bool,
-        source: Optional[str] = None, version_key: Optional[str] = None,
+        source: Optional[str] = None, old_version_key: Optional[str] = None,
         auto_save: bool = True,
     ) -> tuple:
         """单副本启用/停用（内部方法，由 set_enabled 调度层调用）。
 
         返回 (ok: bool, new_version_key: str|None)
-        new_version_key = 物理层之后 mod_version_key(info)，物理层搬目录后会变。
-        必须传入 version_key（精确到物理副本粒度）。
+        old_version_key = 调用方传入的物理层搬目录之前的 key；
+        new_version_key = 物理层执行之后用 mod_version_key(info) 重算的当前 key（搬目录后会变）。
+        必须传入 old_version_key（精确到物理副本粒度）。
         """
-        if not version_key:
-            _log.error("[set_enabled_inner] 必须传 version_key！mod_id=%s", mod_id)
+        if not old_version_key:
+            _log.error("[set_enabled_inner] 必须传 old_version_key！mod_id=%s", mod_id)
             return False, None
-        info = self._find_by_key(version_key)
+        # 合并式工坊 mod：一个工坊文件夹里平铺多个 manifest（如 3749627968 下的
+        # NecrobinderCardPortraits / OrchisNecrobinderSkinMod / ...），这些 mod 共享同一个
+        # install_dir → _find_by_key(install_dir) 只会命中第一个，导致操作 A 却改了 B。
+        # 必须先用 mod_id 限定到自己的副本列表，再按 old_version_key 精确匹配。
+        info = None
+        for v in self.available_versions(mod_id):
+            if mod_version_key(v) == old_version_key:
+                info = v
+                break
+        if info is None:
+            info = self._find_by_key(old_version_key)
         if info is None or self._game is None:
-            _log.warning("[set_enabled_inner] version_key=%s 找不到或 GameInstall 为空 → 忽略", version_key)
+            _log.warning("[set_enabled_inner] old_version_key=%s 找不到或 GameInstall 为空 → 忽略", old_version_key)
             return False, None
 
         # P1: Pinned Mod 保护 —— 如果 enabled 被锁定，拒绝停用/启用操作
@@ -3578,7 +4234,7 @@ class ModManager:
         # =====================================================================
         phys_ok = True  # workshop mod 无物理操作，直接标记 OK
         if is_workshop_related:
-            _log.info("[set_enabled] 物理层(workshop): %s — 不动 manifest，只改 settings.save is_enabled", info.mod_id)
+            _log.debug("[set_enabled] 物理层(workshop): %s — 不动 manifest，只改 settings.save is_enabled", info.mod_id)
         elif info.source == "local" and not enable:
             # 本地停用：搬 Mods/ → disabled_dir
             # 物理约束：disabled_dir/<folder_name> 同一时间也只能有一个副本
@@ -3587,21 +4243,31 @@ class ModManager:
             mid_lower = info.mod_id.lower()
             disabled_target = self._game.disabled_dir / info.folder_name
             if disabled_target.exists():
-                for i, v in enumerate(self._mod_versions.get(mid_lower, [])):
+                for i, v in enumerate(self.available_versions(mid_lower)):
                     if v.source == "disabled" and str(v.install_dir) == str(disabled_target):
                         swap_dir = self._game.disabled_dir / f"{info.folder_name}.swap-{int(time.time())}"
                         import os as _os
                         _os.replace(str(v.install_dir), str(swap_dir))
-                        _log.info("[set_enabled] 停用冲突: disabled_dir/%s 被另一份副本占着 → 先挪到 swap %s",
+                        _log.debug("[set_enabled] 停用冲突: disabled_dir/%s 被另一份副本占着 → 先挪到 swap %s",
                                   info.folder_name, swap_dir)
-                        self._mod_versions[mid_lower].pop(i)
+                        # 2026-11-05: 找 v 所在的精确 bucket_key 再 pop（不能直接用基础桶）
+                        for bk, _vs in self._mod_versions.items():
+                            if bk != mid_lower and not bk.startswith(mid_lower + "::"):
+                                continue
+                            for _j, _vv in enumerate(_vs):
+                                if _vv is v:
+                                    self._mod_versions[bk].pop(_j)
+                                    break
+                            else:
+                                continue
+                            break
                         cur_main = self._mods.get(mid_lower)
                         if cur_main and str(cur_main.install_dir) == str(disabled_target):
                             self._mods[mid_lower] = info
                         break
             info = move_mod_between(info, self._game.disabled_dir, target_source="disabled")
             phys_ok = True
-            _log.info("[set_enabled] 物理层(local停用): %s 搬去 disabled/", info.mod_id)
+            _log.debug("[set_enabled] 物理层(local停用): %s 搬去 disabled/", info.mod_id)
         elif info.source == "disabled" and enable:
             # 停用侧启用：搬 mods_disabled/ → Mods/
             # 物理约束：Mods/<folder_name> 同一时间只能有一个副本
@@ -3609,23 +4275,23 @@ class ModManager:
             _, info = self._preempt_existing_local(info)
             target_mods = self._game.mods_dir / info.folder_name
             if info.source == "local" and str(info.install_dir) == str(target_mods):
-                _log.info("[set_enabled] 物理层(启用): %s 抢占已到位，跳过 move_mod_between", info.mod_id)
+                _log.debug("[set_enabled] 物理层(启用): %s 抢占已到位，跳过 move_mod_between", info.mod_id)
                 phys_ok = True
             else:
                 info = move_mod_between(info, self._game.mods_dir, target_source="local")
                 phys_ok = True
-                _log.info("[set_enabled] 物理层(启用): %s 搬去 Mods/", info.mod_id)
+                _log.debug("[set_enabled] 物理层(启用): %s 搬去 Mods/", info.mod_id)
         else:
-            _log.info("[set_enabled] 物理层: %s source=%s enable=%s → 已是目标状态，跳过物理操作",
+            _log.debug("[set_enabled] 物理层: %s source=%s enable=%s → 已是目标状态，跳过物理操作",
                       info.mod_id, info.source, enable)
             phys_ok = True
 
-        # 2026-11-04：物理层之后算 state_key = version_key
+        # 2026-11-04：物理层之后重算 new_version_key
         # 物理层搬目录会改 info.install_dir（Mods/ ↔ .mods_disabled/），
         # 必须在物理层之后才能拿到当前真实路径 → 作为 source_states 的唯一 key。
         # workshop 副本 install_dir 是 Steam 路径，天然唯一；local/disabled 搬目录后路径已更新，
         # 存的永远是当前物理位置 → 下次扫描能精确对上。
-        _state_key = mod_version_key(info)
+        new_version_key = mod_version_key(info)
 
         # ====== 关键修复：把物理层返回的新 info 同步回内存模型 self._mods ======
         # 否则 get_state → _mod_dict 序列化出来的还是旧 source/install_dir → 前端看到的图标/路径都不对
@@ -3639,12 +4305,23 @@ class ModManager:
         # 2026-10-15 修复：用物理层之前保存的 _orig_install_dir 精确匹配！
         # 物理层搬目录后 install_dir 变了，直接用新路径可能匹配到另一个物理副本
         # 同时去掉 norm_mod_source 匹配——norm_mod_source("local") == norm_mod_source("disabled") → 会覆盖
-        for i, v in enumerate(self._mod_versions.get(mid_lower, [])):
-            if str(v.install_dir) == _orig_install_dir:
-                self._mod_versions[mid_lower][i] = info
-                break
+        # 2026-11-05: 物理层搬目录后 info 可能跨桶（workshop → local），用 bucket_key 重新分类
+        _orig_str = str(_orig_install_dir)
+        for bk, _versions in list(self._mod_versions.items()):
+            if bk != mid_lower and not bk.startswith(mid_lower + "::"):
+                continue
+            for _i, v in enumerate(_versions):
+                if str(v.install_dir) == _orig_str:
+                    self._mod_versions[bk].pop(_i)
+                    break
+            else:
+                continue
+            break
+        # 把 info 加到新桶（按更新后的 workshop_id 重新算 bucket_key）
+        new_bk = self._bucket_key(mid_lower, getattr(info, 'workshop_id', None))
+        self._mod_versions.setdefault(new_bk, []).append(info)
         # 更新最近活动时间（启/停都是用户操作，都要 touch）
-        self._touch_activity(info.mod_id)
+        self._touch_activity(info.mod_id, getattr(info, 'workshop_id', None))
         _log.debug("[set_enabled] 内存同步: %s source=%s install_dir=%s",
                    info.mod_id, info.source, info.install_dir)
 
@@ -3652,15 +4329,26 @@ class ModManager:
         # 逻辑层：settings.save is_enabled + _source_states + 排序
         # =====================================================================
         if self.uses_native_mod_list:
-            # 2026-11-04: key 改成 version_key（物理层之后算的，当前物理路径）
-            self._source_states.setdefault(mid_lower, {})[_state_key] = enable
+            # 2026-11-06: outer key 改成 bucket_key，每个物理副本独立
+            bk = self._bucket_key(info.mod_id, getattr(info, 'workshop_id', None))
+            self._source_states.setdefault(bk, {})[new_version_key] = enable
 
-            # 记录最近 toggle 时间（前端停用侧排序用）
-            self._source_last_toggled.setdefault(mid_lower, {})[_state_key] = time.time()
+            # 记录最近 toggle 时间 + 分开的 enabled_at / disabled_at（前端停用侧排序主依据）
+            now_t = time.time()
+            self._source_last_toggled.setdefault(mid_lower, {})[new_version_key] = now_t
+            if enable:
+                self._source_enabled_at.setdefault(mid_lower, {})[new_version_key] = now_t
+            else:
+                self._source_disabled_at.setdefault(mid_lower, {})[new_version_key] = now_t
+                # 2026-11-07: batch_seq 彻底删，换微秒差
 
             # 从 source_states 聚合：该 canonical 整体 is_enabled（任何 source 启用即为 True）
-            mod_ss = self._source_states.get(mid_lower, {})
-            canonical_any_enabled = bool(mod_ss) and any(mod_ss.values())
+            # 2026-11-06: 扫所有同 mod_id 的 bucket_key（基础桶 + 所有派生桶），不能只查一个
+            canonical_any_enabled = False
+            for ss_bk, ss_inner in self._source_states.items():
+                if ss_bk.split("::")[0] == mid_lower and isinstance(ss_inner, dict) and any(ss_inner.values()):
+                    canonical_any_enabled = True
+                    break
 
             # 更新 settings.save 里该 canonical 的 is_enabled（canonical 粒度，不带 source）
             ms = self._native_full_data.setdefault("mod_settings", {})
@@ -3698,7 +4386,7 @@ class ModManager:
             #   现在只做「canonical 在哪个侧」的简单判断，不动列表内部顺序。
             self._state.enabled_order = [m for m in self._state.enabled_order if m.lower() != mid_lower]
             self._state.disabled_order = [m for m in self._state.disabled_order if m.lower() != mid_lower]
-            # mod_ss 和 canonical_any_enabled 上面已经算过了，直接用
+            # 2026-11-06: canonical_any_enabled 上面已经扫所有 bucket_key 算过了，直接用
             canonical = info.mod_id
             if canonical_any_enabled:
                 # 该 mod 至少一个 source 启用 → 加回 enabled_order 后做游戏原生排序
@@ -3712,7 +4400,7 @@ class ModManager:
                 self._state.disabled_order.insert(0, canonical)
             _log.info(
                 "[set_enabled] 原生清单模式：state_key=%s enable=%s；source_states[%s]=%s；enabled_order(%d) disabled_order(%d)",
-                _state_key, enable, mid_lower, mod_ss,
+                new_version_key, enable, bk, self._source_states.get(bk, {}),
                 len(self._state.enabled_order), len(self._state.disabled_order),
             )
             if auto_save: self.save_state()
@@ -3720,7 +4408,7 @@ class ModManager:
             self._invalidate_mod_caches()
             # 2026-11-05: 返回 (ok, new_version_key) 给调度层，互斥需要跳过这个确切副本
             # new_version_key = mod_version_key(info) 在物理层之后算的，不会因为搬目录变
-            return True, _state_key
+            return True, new_version_key
 
         # =====================================================================
         # 模式 A：BetterModMenu（原生清单不可用 + prefer_better_mod_menu=True + 已安装 BMM）
@@ -3781,7 +4469,7 @@ class ModManager:
                       enable, len(self._state.enabled_order), len(self._state.disabled_order))
             if auto_save: self.save_state()
             else: self._mark_dirty()
-            return True, _state_key
+            return True, new_version_key
 
         # =====================================================================
         # 模式 B：fallback（物理目录驱动 = LOM 没启用）
@@ -3794,14 +4482,14 @@ class ModManager:
         self._state.disabled_order = [m for m in self._state.disabled_order if m.lower() != mid_lower]
         if enable:
             self._state.enabled_order.append(canonical)
-            _log.info("[set_enabled] %s → 加入启用侧 (size=%d)", canonical, len(self._state.enabled_order))
+            _log.debug("[set_enabled] %s → 加入启用侧 (size=%d)", canonical, len(self._state.enabled_order))
         else:
             self._state.disabled_order.append(canonical)
-            _log.info("[set_enabled] %s → 加入停用侧 (size=%d)", canonical, len(self._state.disabled_order))
+            _log.debug("[set_enabled] %s → 加入停用侧 (size=%d)", canonical, len(self._state.disabled_order))
         self._invalidate_mod_caches()
         if auto_save: self.save_state()
         else: self._mark_dirty()
-        return True, _state_key
+        return True, new_version_key
 
     # --------------------------------------------------------------- 启动游戏
 
@@ -3907,7 +4595,7 @@ class ModManager:
                     ["cmd.exe", "/c", "start", "", steam_url],
                     close_fds=True,
                 )
-                _log.info("[launch][%s] 方案1(cmd/start) 已提交。请在 10 秒内留意 Steam 版本选择弹窗（可能在窗口后面）。", aid)
+                _log.debug("[launch][%s] 方案1(cmd/start) 已提交。请在 10 秒内留意 Steam 版本选择弹窗（可能在窗口后面）。", aid)
                 return
             except Exception as e:
                 _log.warning("[launch][%s] 方案1(cmd/start) 失败: %s", aid, e, exc_info=True)
@@ -3923,7 +4611,7 @@ class ModManager:
             # ============================================================
             if sys.platform == "win32":
                 try:
-                    _log.info("[launch][%s] 方案2: ShellExecuteW(NULL, 'open', '%s', NULL, NULL, SW_SHOWNORMAL)", aid, steam_url)
+                    _log.debug("[launch][%s] 方案2: ShellExecuteW(NULL, 'open', '%s', NULL, NULL, SW_SHOWNORMAL)", aid, steam_url)
                     hinstance = ctypes.windll.shell32.ShellExecuteW(
                         None,                # hwnd = 无主窗口
                         "open",              # operation
@@ -3934,7 +4622,7 @@ class ModManager:
                     )
                     _log.info("[launch][%s] 方案2 ShellExecuteW 返回值: %s (>32 表示成功)", aid, hinstance)
                     if int(hinstance) > 32:
-                        _log.info("[launch][%s] 方案2(ShellExecuteW) 成功提交给 Shell。", aid)
+                        _log.debug("[launch][%s] 方案2(ShellExecuteW) 成功提交给 Shell。", aid)
                         return
                     # 失败：列出常见错误码
                     err_map = {
@@ -3969,7 +4657,7 @@ class ModManager:
                 try:
                     _log.info("[launch][%s] 方案3: os.startfile('%s')", aid, steam_url)
                     os.startfile(steam_url)  # type: ignore[attr-defined]
-                    _log.info("[launch][%s] 方案3(os.startfile) 已提交。", aid)
+                    _log.debug("[launch][%s] 方案3(os.startfile) 已提交。", aid)
                     return
                 except Exception as e:
                     _log.warning("[launch][%s] 方案3 失败: %s", aid, e)
@@ -3985,7 +4673,7 @@ class ModManager:
                     close_fds=True,
                     creationflags=0,
                 )
-                _log.info("[launch][%s] 方案4(explorer) 已提交。", aid)
+                _log.debug("[launch][%s] 方案4(explorer) 已提交。", aid)
                 return
             except Exception as e:
                 _log.warning("[launch][%s] 方案4 失败: %s", aid, e)
@@ -4531,7 +5219,7 @@ class ModManager:
                 try:
                     set_workshop_mod_disabled(info, disabled=False, game=self._game)
                     restored += 1
-                    _log.info("[migrate] 工坊 manifest 还原: %s (%s)", info.mod_id, cand)
+                    _log.debug("[migrate] 工坊 manifest 还原: %s (%s)", info.mod_id, cand)
                 except Exception as e:
                     _log.warning("[migrate] 还原 %s 失败: %s", info.mod_id, e)
                 break
@@ -4568,11 +5256,11 @@ class ModManager:
                     if want_enabled and not cur_local:
                         move_mod_between(info, self._game.mods_dir, target_source="local")
                         changed_count += 1
-                        _log.info("[apply] local %s: → Mods/ (启用)", info.mod_id)
+                        _log.debug("[apply] local %s: → Mods/ (启用)", info.mod_id)
                     elif not want_enabled and cur_local:
                         move_mod_between(info, self._game.disabled_dir, target_source="disabled")
                         changed_count += 1
-                        _log.info("[apply] local %s: → disabled_dir/ (停用)", info.mod_id)
+                        _log.debug("[apply] local %s: → disabled_dir/ (停用)", info.mod_id)
 
             except Exception as e:
                 _log.warning("[apply] %s 物理操作失败: %s", mid, e)
@@ -4698,9 +5386,11 @@ class ModManager:
                 canonical_enabled[mid.lower()] = True
             for mid in self._state.disabled_order:
                 canonical_enabled.setdefault(mid.lower(), False)
+            # 2026-11-06 P1：_source_states 的 outer key 是 bucket_key，必须 split 后再和 _mods（纯 mod_id）比
             for low, states in self._source_states.items():
-                if low in self._mods:
-                    canonical_enabled[low] = any(states.values())
+                mid = low.split("::")[0]
+                if mid in self._mods:
+                    canonical_enabled[mid] = canonical_enabled.get(mid, False) or any(states.values())
 
             # 按 enabled_order 重排：enabled_order 里的排前面，disabled_order 里的排后面
             enabled_lower = {m.lower() for m in self._state.enabled_order}
@@ -4773,9 +5463,12 @@ class ModManager:
         for mid in self._state.disabled_order:
             canonical_enabled.setdefault(mid.lower(), False)
         # source_states 覆盖（多副本 granularity）
+        # 2026-11-06: outer key 是 bucket_key 格式（"watcher::3747526116"），_mods 是纯 mod_id.lower()（"watcher"）
+        # 必须先 split("::")[0] 再比较，否则永远对不上 → per-source 覆盖永远跳过
         for low, states in self._source_states.items():
-            if low in self._mods:
-                canonical_enabled[low] = any(states.values())
+            mid = low.split("::")[0]
+            if mid in self._mods:
+                canonical_enabled[mid] = any(states.values())
 
         # 只更新 old_list 里已有的条目
         new_list: list[dict] = []
@@ -4832,7 +5525,7 @@ class ModManager:
 
         current = cfg.get("OpenLogWindowOnStartup", "")
         if str(current).lower() == "true":
-            _log.info("[baselib_log] OpenLogWindowOnStartup 已是 True，无需修改")
+            _log.debug("[baselib_log] OpenLogWindowOnStartup 已是 True，无需修改")
             return
 
         cfg["OpenLogWindowOnStartup"] = "True"

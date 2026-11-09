@@ -49,6 +49,20 @@ def _safe_name(name: str) -> str:
     return s[:80]
 
 
+def _backup_key(mod_id: str, workshop_id=None) -> str:
+    """备份身份 key（bucket_key 风格，把 `::` 换成 Windows 安全的 `__`）。
+
+    2026-11-06: 新增，让不同 workshop 撞 mod_id 的副本各有独立备份目录。
+    有数字 workshop_id → `f"{mid_lower}__{wid}"`；否则 `mid_lower`（local/disabled 副本）。
+    """
+    low = str(mod_id).lower()
+    if workshop_id is not None:
+        s = str(workshop_id)
+        if s.isdigit():
+            return f"{low}__{s}"
+    return low
+
+
 def _now() -> tuple[int, str]:
     ts = int(time.time())
     return ts, datetime.fromtimestamp(ts).strftime("%Y%m%d-%H%M%S")
@@ -105,11 +119,26 @@ class BackupManager:
                 self._cache_mtime = -1.0
 
     # ------------------------------------------------------------------ 查询
-    def list(self, mod_id: Optional[str] = None) -> list[dict]:
+    def list(self, mod_id: Optional[str] = None,
+             workshop_id: Optional[Any] = None) -> list[dict]:
+        """列出备份记录。
+
+        2026-11-06: 新增可选 workshop_id 参数，精确匹配 backup_key。
+        老备份没有 backup_key 字段 → fallback 到 mod_id_lower 匹配（兼容升级）。
+        """
         recs = list(self._load_index())
         if mod_id:
-            key = str(mod_id).lower()
-            recs = [r for r in recs if str(r.get("mod_id", "")).lower() == key]
+            # 目标 backup_key（有 workshop_id 用派生桶，否则用基础桶）
+            target_bk = _backup_key(mod_id, workshop_id)
+            # 过滤：新格式 backup_key 精确匹配 OR 老格式 mod_id_lower fallback
+            # 但只在没有 backup_key 的老记录里 fallback——新记录必须严格匹配 backup_key
+            def _match(r: dict) -> bool:
+                r_bk = str(r.get("backup_key", ""))
+                if r_bk:
+                    return r_bk == target_bk
+                # 老记录（无 backup_key）：按 mod_id_lower 匹配
+                return str(r.get("mod_id", "")).lower() == str(mod_id).lower()
+            recs = [r for r in recs if _match(r)]
         recs.sort(key=lambda r: int(r.get("ts", 0)), reverse=True)
         return [self._enrich(r) for r in recs]
 
@@ -127,8 +156,8 @@ class BackupManager:
                 return r
         return None
 
-    def latest_for(self, mod_id: str) -> Optional[dict]:
-        recs = self.list(mod_id)
+    def latest_for(self, mod_id: str, workshop_id=None) -> Optional[dict]:
+        recs = self.list(mod_id, workshop_id)
         return recs[0] if recs else None
 
     def stats(self) -> dict:
@@ -176,7 +205,7 @@ class BackupManager:
         """
         if info is None or info.install_dir is None:
             return False
-        latest = self.latest_for(info.mod_id)
+        latest = self.latest_for(info.mod_id, info.workshop_id)
         if latest is None:
             return False
         try:
@@ -230,7 +259,9 @@ class BackupManager:
         ts, stamp = _now()
         backup_id = f"{mod_id.lower()}_{ts}"
 
-        folder = self.root / _safe_name(mod_id)
+        # 2026-11-06: 目录名用 backup_key 让不同 workshop 撞 mod_id 的副本独立存
+        bk = _backup_key(mod_id, info.workshop_id)
+        folder = self.root / _safe_name(bk)
         folder.mkdir(parents=True, exist_ok=True)
         safe_ver = _safe_name(version) if version else "nover"
         archive = folder / f"{stamp}__{safe_ver}.zip"
@@ -291,6 +322,7 @@ class BackupManager:
             "id": backup_id,
             "mod_id": mod_id,
             "mod_id_lower": mod_id.lower(),
+            "backup_key": bk,  # 2026-11-06: 备份身份 key，让不同 workshop 撞 mod_id 独立
             "name": str(info.display_name or mod_id),
             "version": version,
             "author": str(info.manifest.author or ""),
@@ -317,19 +349,29 @@ class BackupManager:
             recs = self._load_index()
             recs = [r for r in recs if str(r.get("id")) != backup_id]
             recs.append(record)
-            recs = self._rotate(recs, mod_id)
+            recs = self._rotate(recs, bk)
             self._save_index(recs)
 
         _log.info("[backup] 完成 %s: %.1f MB -> %.1f MB",
                   mod_id, original_bytes / 1e6, archive_bytes / 1e6)
         return self._enrich(record)
 
-    def _rotate(self, recs: list[dict], mod_id: str) -> list[dict]:
-        """每个 mod 只保留最新 keep_versions 份，删掉超出的（含归档文件）。"""
+    def _rotate(self, recs: list[dict], backup_key: str) -> list[dict]:
+        """每个 backup_key 只保留最新 keep_versions 份，删掉超出的（含归档文件）。
+
+        2026-11-06: 参数从 mod_id 改成 backup_key，让不同 workshop 撞 mod_id 的备份独立分组。
+        老备份没有 backup_key 字段 → 用 mod_id_lower fallback 匹配。
+        """
         keep = self._keep_versions
-        key = str(mod_id).lower()
-        mine = [r for r in recs if str(r.get("mod_id", "")).lower() == key]
-        others = [r for r in recs if str(r.get("mod_id", "")).lower() != key]
+
+        def _match_bk(r: dict) -> bool:
+            r_bk = str(r.get("backup_key", ""))
+            if r_bk:
+                return r_bk == backup_key
+            return str(r.get("mod_id", "")).lower() == backup_key
+
+        mine = [r for r in recs if _match_bk(r)]
+        others = [r for r in recs if not _match_bk(r)]
         if len(mine) <= keep:
             return recs
         mine.sort(key=lambda r: int(r.get("ts", 0)), reverse=True)
@@ -367,9 +409,9 @@ class BackupManager:
             self._save_index([r for r in recs if str(r.get("id")) != str(backup_id)])
         return True
 
-    def delete_all_for(self, mod_id: str) -> int:
+    def delete_all_for(self, mod_id: str, workshop_id=None) -> int:
         n = 0
-        for r in self.list(mod_id):
+        for r in self.list(mod_id, workshop_id):
             if self.delete(str(r.get("id"))):
                 n += 1
         return n

@@ -162,16 +162,25 @@ class Api:
                 display_name = ws_title
 
         # 2026-10-13 修复：last_activity 兜底用 install_dir mtime（新扫描/从未 toggle 的 mod 不会是 0）
-        _la = self.manager._state.last_activity.get(info.mod_id.lower(), 0)
-        if _la == 0 and info.install_dir is not None:
-            try:
-                _la = int(os.path.getmtime(str(info.install_dir)))
-            except Exception:
-                pass
+        # 2026-11-05: 用 bucket_key 查，让不同 workshop 撞 mod_id 的副本各自独立记录
+        # 2026-11-07 Step 1: 改用 info.mtime（scanner 扫描时已固化，不再每次 stat()）
+        _la = self.manager._state.last_activity.get(
+            self.manager._bucket_key(info.mod_id, getattr(info, 'workshop_id', None)), 0)
+        if _la == 0 and info.mtime > 0:
+            _la = int(info.mtime)
+        # P0-2026-11-06：_source_states 的 outer key 是 bucket_key（modid::wid），
+        # 用纯 mod_id 查永远拿到 {} → 前端副本状态全部走"默认启用"，保存后状态回滚。
+        # 这里按 mod_id 前缀聚合该 mod 的所有桶，保持 canonical.source_states 原有语义。
+        _src_states_merged: dict = {}
+        for _bk, _ss in self.manager._source_states.items():
+            if _bk.split("::")[0] == info.mod_id.lower() and isinstance(_ss, dict):
+                _src_states_merged.update(_ss)
         return {
             "id": info.mod_id,
             "name": display_name,
-            "author": info.manifest.author,
+            "author": info.manifest.author or (
+                self._try_get_workshop_author(info.workshop_id) if info.workshop_id else None
+            ),
             "version": info.manifest.version,
             "description": info.manifest.description,
             "dependencies": info.manifest.dependencies,
@@ -211,6 +220,9 @@ class Api:
             "pinned": self.manager.get_pinned(info.mod_id),  # {version, enabled} or None
             # ===== 最近活动时间（停用列表排序用） =====
             "last_activity": _la,
+            # 2026-11-07 Step 1: scanner 固化的文件系统时间（前端排序链兜底）
+            "mtime": info.mtime,
+            "ctime": info.ctime,
             # ===== godot.log 解析：大型 mod 的子内容（子角色/子模块/子卡牌池）=====
             # 比如 Downfall → {"initializers": ["Snecko","SlimeBoss",...], "creatings": ["Snecko",...]}
             # 来自游戏启动时 BaseLib 注册日志，比 DLL 反编译准得多
@@ -221,7 +233,7 @@ class Api:
             # ===== 2026-10 新增：每个 mod_id 下各 source 的独立启停状态 =====
             # 格式：{ "steam_workshop": bool, "mods_directory": bool }
             # 同 mod_id 的工坊副本和本地副本各自独立启停
-            "source_states": self.manager._source_states.get(info.mod_id.lower(), {}),
+            "source_states": _src_states_merged,
         }
 
     def _calc_mod_version_compat(self, info: ModInfo) -> dict:
@@ -345,6 +357,22 @@ class Api:
             return None
         return None
 
+    def _try_get_workshop_author(self, workshop_id: str) -> str | None:
+        """社区页缓存里的作者昵称（mod.json 未填作者时兜底）。
+
+        纯 SteamID64（缓存里可能只存了数字 id）不算有效昵称，返回 None，
+        避免把一长串数字显示成作者。
+        """
+        try:
+            from .workshop import _load_cached
+            meta = _load_cached(str(workshop_id), self.manager.get_language()) or {}
+            name = str(meta.get("author") or "").strip()
+            if name and not name.isdigit():
+                return name
+        except Exception:
+            return None
+        return None
+
     def _scan_local_preview(self, install_dir) -> str | None:
         """扫描本地 mod 文件夹里的预览图，返回 file:// URL 或 None。
 
@@ -416,19 +444,37 @@ class Api:
         每个磁盘上的独立副本目录都返回一条。
         2026-10 删除 is_active（活动/非活动副本选择逻辑废弃）；保留 is_enabled 用于多 source 独立启停。
 
-        2026-11-01 多副本修复：workshop 副本的 state_key 改成 ws_{workshop_id}，
-        不再用统一的 "steam_workshop"——因为同 mod_id 可能有多个 workshop 副本
-        （如圣主历险记原版 vs 修复版，workshop_id 不同），需要独立记录启停状态。
+        state_key 统一为 mod_version_key(v)（= str(install_dir)），按物理副本粒度
+        独立记录启停状态；同 mod_id 的多个 workshop 副本（workshop_id 不同）因此天然分开。
+        注意该 key 会随搬目录变化，必须用搬目录之后的值（与 store_mods 写入侧一致）。
         """
-        src_states = self.manager._source_states.get(active.mod_id.lower(), {})
-        src_toggled = self.manager._source_last_toggled.get(active.mod_id.lower(), {})
+        # P0-2026-11-06：状态按副本自己的 bucket_key 查，见下方循环内 v_src_states / v_src_toggled。
+        canonical_la = self.manager._state.last_activity.get(
+            self.manager._bucket_key(active.mod_id, getattr(active, 'workshop_id', None)), 0)
         results: list[dict] = []
+        # P2-2026-11-06：_mods 统一为纯 mod_id，canonical 代表不再一一对应某个 workshop；
+        # 这里必须模糊取回该 mod_id 的全部物理副本，否则同 mod_id 的第二个工坊副本会丢行。
+        # 前端 expandModList 按 mod_id + version_key 去重，两个 canonical 行重复展开不会重复显示。
         versions_list = self.manager.available_versions(active.mod_id)
+        # 合集工坊 mod：一个工坊目录平铺多个 manifest，Steam 标题属于整个合集，
+        # 逐条都用它会出现多条「同名」；同目录 >1 个 mod_id 时改用各自 manifest 名。
+        shared_dirs: dict[str, int] = {}
+        for _mm in self.manager._mods.values():
+            if _mm.install_dir:
+                _k = str(_mm.install_dir)
+                shared_dirs[_k] = shared_dirs.get(_k, 0) + 1
         for v in versions_list:
             v_state_key = mod_version_key(v)
+            # 时间戳 outer key = mod_id.lower()（store_mods.py _set_enabled_inner / commit_changes 写入一致）
+            mid_l = v.mod_id.lower()
+            v_toggled_all = self.manager._source_last_toggled.get(mid_l, {})
+            v_enabled_at_all = self.manager._source_enabled_at.get(mid_l, {})
+            v_disabled_at_all = self.manager._source_disabled_at.get(mid_l, {})
+            # 2026-11-07: batch_seq 彻底删
             # 每个副本独立的显示名：Steam workshop title > mod.json name
             v_display_name = v.display_name
-            if v.source == "workshop" and v.workshop_id:
+            if (v.source == "workshop" and v.workshop_id
+                    and shared_dirs.get(str(v.install_dir), 0) <= 1):
                 ws_title = self._try_get_workshop_title(v.workshop_id)
                 if ws_title:
                     v_display_name = ws_title
@@ -441,11 +487,21 @@ class Api:
                 "source_label": v.source_label,
                 "path": str(v.install_dir) if v.install_dir else None,
                 "workshop_id": v.workshop_id,
-                # 该副本在 source_states 里的独立启停状态
-                # 有记录就用记录，没有的话：workshop 副本默认真（物理恒 ACTIVE），local 副本看 source
-                "is_enabled": src_states.get(v_state_key, bool(v.source == "workshop" or v.source == "local")),
+                # 该副本的启用基线（与 commit_changes 互斥共用同一判定）
+                "is_enabled": self.manager._copy_baseline_enabled(v),
                 # 前端 displayList 停用侧排序用——刚停的副本排顶部
-                "last_toggled_at": src_toggled.get(v_state_key, 0.0),
+                # 从没 toggle 过（0.0）就 fallback 到 canonical 的 last_activity
+                # （安装目录 mtime，保证新扫描的 mod 也有合理排序）
+                "last_toggled_at": v_toggled_all.get(v_state_key, 0.0) or canonical_la,
+                # 分开的启停时间（前端停用侧排序主依据：disabled_at DESC，同值 batch_seq ASC）
+                "enabled_at": v_enabled_at_all.get(v_state_key, 0.0),
+                "disabled_at": v_disabled_at_all.get(v_state_key, 0.0),
+                # 2026-11-07: batch_seq 彻底删，用 disabled_at 微秒差替代
+                # 2026-11-07 Step 1: scanner 固化的文件系统时间（排序链兜底）
+                "mtime": v.mtime,
+                "ctime": v.ctime,
+                # 未订阅黄标：mod_id 在 unsubscribed_mod_ids 里（Steam 退订残留目录）
+                "is_unsubscribed": v.mod_id.lower() in self.manager._unsubscribed_mod_ids,
             })
         return results
 
@@ -453,11 +509,14 @@ class Api:
         """全部工坊副本的 workshop_id（含同 mod_id 的多副本），按出现顺序去重。"""
         out: list[str] = []
         seen: set[str] = set()
-        for info in self.manager.all_mods.values():
-            wid = str(info.workshop_id) if info.workshop_id else ""
-            if wid and wid not in seen:
-                seen.add(wid)
-                out.append(wid)
+        # P2-2026-11-06：all_mods 是 canonical（纯 mod_id）投影，同 mod_id 的第二个
+        # 工坊副本不在其中；标题/预览补全必须遍历 _mod_versions 的全部物理副本。
+        for versions in self.manager._mod_versions.values():
+            for info in versions:
+                wid = str(info.workshop_id) if info.workshop_id else ""
+                if wid and wid not in seen:
+                    seen.add(wid)
+                    out.append(wid)
         return out
 
     def _titles_pending_count(self) -> int:
@@ -623,6 +682,8 @@ class Api:
     def _snapshot(self) -> dict:
         """当前所有物理副本的 {(lower mod_id, version_key): version} 快照。
 
+        2026-11-05: version_key 改为 mod_version_key(v)（= f"install_dir#mod_id.lower()"），
+        合集工坊同目录多 manifest 不再撞 inner key。
         2026-11-04：从 {mod_id: version} 改为 {(mod_id, version_key): version}。
         多副本 mod（如同时有 workshop + local 版本）删一个副本后，
         旧逻辑因为 mod_id 还存在所以算不出 deleted；
@@ -630,15 +691,14 @@ class Api:
         """
         snap: dict = {}
         for low, info in self.manager.all_mods.items():
-            versions = self.manager._mod_versions.get(low, [])
+            versions = self.manager.available_versions(low)
             if versions:
                 for v in versions:
-                    vk = str(v.install_dir) if v.install_dir else ''
-                    if vk:
-                        snap[(low, vk)] = v.manifest.version or ''
+                    vk = mod_version_key(v)
+                    snap[(low, vk)] = v.manifest.version or ''
             # fallback：没 _mod_versions 时用 canonical info
-            vk = str(info.install_dir) if info.install_dir else ''
-            if vk and (low, vk) not in snap:
+            vk = mod_version_key(info)
+            if (low, vk) not in snap:
                 snap[(low, vk)] = info.manifest.version or ''
         return snap
 
@@ -2369,20 +2429,108 @@ class Api:
         from .workshop import get_html_tasks
         return get_html_tasks()
 
-    def request_workshop_translation(self, mod_id: str) -> dict:
+    def request_workshop_translation(self, mod_id: str, workshop_id: str | None = None) -> dict:
         """用户手动触发：绕过中文占比门控，抓一次社区页中文描述。
 
         只对当前选中 mod 生效，不自动重试；完成后前端轮询 get_html_tasks 刷新预览。
+        workshop_id: 可选，有则精确命中同 mod_id 多 workshop 场景。
         """
         from .workshop import ensure_html
 
-        info = self.manager.active_version(str(mod_id))
-        if info is None or info.source != "workshop" or not info.workshop_id:
+        info = self._find_workshop_info(str(mod_id), workshop_id)
+        if info is None:
             return {"ok": False, "error": "not_workshop"}
         lang = self.manager.get_language()
         res = ensure_html(str(info.workshop_id), lang, reason="manual", force=True)
         status = res.get("status")
         return {"ok": status in ("queued", "running", "cached"), **res}
+
+    def fetch_mod_deps(self, mod_id: str) -> dict:
+        """前端启用时即时拉取工坊依赖，不等扫描/保存。
+
+        只处理单个 workshop mod：manifest 已带 dependencies 直接返回；
+        否则抓一次社区页并写回内存 manifest，供前端立即显示缺失依赖警告。
+        失败静默返回 ok=False，不影响启停。
+        """
+        from .store_mods import _DEPS_CACHE_LOCK, _DEPS_CACHE_TTL  # 延迟导入防循环依赖
+        info = self.manager.active_version(str(mod_id))
+        if info is None or not info.workshop_id:
+            # active_version 在多副本场景可能返回本地副本，回退到按 mod_id 找工坊副本
+            for v in self.manager.available_versions(str(mod_id)):
+                if v.workshop_id:
+                    info = v
+                    break
+        if info is None or not info.workshop_id:
+            return {"ok": False, "deps": []}
+        # 内存有 deps → 先看缓存有没有过期（7 天），过期就清掉让它重爬
+        if info.manifest.dependencies:
+            _cache_file = self.manager.data_dir / "cache" / "workshop_deps.json"
+            try:
+                with _DEPS_CACHE_LOCK:
+                    if _cache_file.is_file():
+                        with open(_cache_file, 'r', encoding='utf-8') as _f:
+                            _c = json.load(_f)
+                        _entry = _c.get(str(mod_id).lower())
+                        if isinstance(_entry, dict):
+                            _ts = _entry.get("updated_at", 0)
+                            if time.time() - _ts > _DEPS_CACHE_TTL:
+                                _log.info("[api.fetch_mod_deps] %s 缓存已过期 (%.0fd)，强制重爬",
+                                          mod_id, (time.time() - _ts) / 86400)
+                                info.manifest.dependencies = []
+                        # 兼容老格式：缓存只有数组没有时间戳 → 当作过期
+                        elif isinstance(_entry, list):
+                            info.manifest.dependencies = []
+            except Exception:
+                pass  # 缓存读失败不阻塞，继续用内存 deps
+            if info.manifest.dependencies:
+                return {"ok": True, "deps": list(info.manifest.dependencies), "cached": True}
+
+        try:
+            from .workshop import fetch_workshop_dependencies
+            ws_deps = fetch_workshop_dependencies(str(info.workshop_id), timeout=15)
+        except Exception as e:
+            _log.warning("[api] fetch_mod_deps %s 失败: %s", mod_id, e)
+            ws_deps = None
+        if not ws_deps:
+            return {"ok": False, "deps": []}
+
+        # workshop_id → 本地已安装 mod_id，未安装的保留 wid 原样
+        wid_to_mod: dict[str, str] = {}
+        for m in self.manager.all_mods.values():
+            if m.workshop_id:
+                wid_to_mod[str(m.workshop_id)] = m.mod_id
+        added: list[str] = []
+        for dep in ws_deps:
+            dep_wid = str(dep.get("workshop_id", ""))
+            dep_mod_id = wid_to_mod.get(dep_wid, dep_wid)
+            if dep_mod_id and dep_mod_id not in added:
+                added.append(dep_mod_id)
+        if added:
+            info.manifest.dependencies = added
+            self.manager.recheck_dependencies()
+            # 2026-11-07 v2：持久化到 workshop_deps.json（加锁 + 时间戳防过期）
+            try:
+                _cache_dir = self.manager.data_dir / "cache"
+                _cache_dir.mkdir(parents=True, exist_ok=True)
+                _cache_file = _cache_dir / "workshop_deps.json"
+                with _DEPS_CACHE_LOCK:
+                    _cache = {}
+                    if _cache_file.is_file():
+                        try:
+                            with open(_cache_file, 'r', encoding='utf-8') as _f:
+                                _cache = json.load(_f)
+                        except (json.JSONDecodeError, OSError):
+                            _cache = {}  # 文件损坏就重置
+                    _cache[str(mod_id).lower()] = {
+                        "deps": added,
+                        "updated_at": time.time(),
+                    }
+                    with open(_cache_file, 'w', encoding='utf-8') as _f:
+                        json.dump(_cache, _f, ensure_ascii=False, indent=2)
+                _log.info("[api.fetch_mod_deps] 持久化 %s deps=%s", mod_id, added)
+            except Exception as _e:
+                _log.warning("[api.fetch_mod_deps] 持久化失败: %s", _e)
+        return {"ok": True, "deps": added}
 
     def set_enabled(
         self, mod_id: str, enable: bool,
@@ -2477,6 +2625,33 @@ class Api:
         #   CLI 测试里立刻读 settings.save → 线程还没写完 → 旧值
         #   GUI 里用户保存后立刻关应用 → 线程可能还没写完 → 丢数据）
         return _do()
+
+    def apply_frontend_delta(self, enabled: list[str], disabled: list[str], copy_delta: dict = None) -> dict:
+        """延迟保存架构：前端每次 toggle 后同步后端内存状态。
+
+        只改 _state.enabled_order / disabled_order、_source_states、_native_full_data 内存。
+        不搬目录、不写 settings.save、不写 profile.json —— 这些等 commit_changes。
+        必须同步返回（只改内存，微秒级）。
+        """
+        return self.manager.apply_frontend_delta(enabled, disabled, copy_delta)
+
+    def commit_changes(self, enabled: list[str], disabled: list[str], copy_states: list[dict] = None,
+                       just_touched_list: list[dict] = None) -> dict:
+        """延迟保存架构：原子化提交前端纯改 state 攒的所有启停变更。
+
+        前端维护 state.enabled / state.disabled（mod_id 列表），每次启停只改前端数组。
+        copy_states 是副本级启停明细 [{version_key, mod_id, workshop_id, enabled}]，
+        用于表达「同 mod_id 只启用其中一个副本」；后端优先按副本级意图执行，
+        没有副本级意图时才回退到 canonical 列表。
+        just_touched_list 是 2026-11-07 Step 3 新增：
+          前端 touchedKeys Set 反解的三元组 [{mod_id, workshop_id, version_key}]
+          只包含用户直接碰过（toggle/批量/拖拽/互斥被动）的副本。
+          后端 Step 3 会强制这些副本 diff=True（不管 source_states 基线），
+          Step 5 会只给这些副本写 disabled_at + 微秒差，其它已停用的老 mod 时间戳保持不动。
+
+        不走线程池——必须同步返回，确保写盘完成后前端再 re-sync。
+        """
+        return self.manager.commit_changes(enabled, disabled, copy_states, just_touched_list)
 
     def _insert_newly_enabled(self, mod_id: str) -> None:
         """新启用 mod 的插入式排序：插到所有依赖它的子 mod 前面。
@@ -2591,18 +2766,39 @@ class Api:
     # select_version / available_versions 公开 API 已于 2026-10 删除（活动/非活动副本选择逻辑废弃）
     # 多副本改由 source_states 多 source 独立启停；_all_versions_dict 仍保留给 get_state 展示
 
-    def get_workshop_details(self, mod_id: str) -> dict:
+    def _find_workshop_info(self, mod_id: str, workshop_id: str | int | None) -> ModInfo | None:
+        """统一辅助：根据 mod_id + 可选 workshop_id 找到带 workshop_id 的 ModInfo。
+
+        有 workshop_id → 精确命中 _mod_versions 对应桶（同 mod_id 多 workshop 场景不串线）；
+        无 workshop_id → 模糊遍历 available_versions 找第一条有 workshop_id 的（向后兼容）。
+        桶 key 构造委托 store_mods._bucket_key（含 isdigit 校验，和存储侧格式严格一致）。
+        """
+        from .store_mods import ModManager
+        mid_lower = str(mod_id).lower()
+        # 精确模式：委托 ModManager._bucket_key 生成 key（和存储侧格式严格一致）
+        if workshop_id is not None:
+            key = ModManager._bucket_key(mod_id, workshop_id)
+            versions = self.manager._mod_versions.get(key)
+            for v in versions or []:
+                if v.workshop_id:
+                    _log.debug("[api._find_workshop_info] 精确命中: mod_id=%s workshop_id=%s key=%s", mod_id, workshop_id, key)
+                    return v
+            _log.debug("[api._find_workshop_info] 精确未命中，fallback: mod_id=%s workshop_id=%s key=%s", mod_id, workshop_id, key)
+        # 模糊 fallback（向后兼容本地 mod / 精确命中失败等场景）
+        for v in self.manager.available_versions(mid_lower):
+            if v.workshop_id:
+                _log.debug("[api._find_workshop_info] 模糊命中: mod_id=%s workshop_id=%s found_wid=%s", mod_id, workshop_id, v.workshop_id)
+                return v
+        _log.debug("[api._find_workshop_info] 完全未命中: mod_id=%s workshop_id=%s", mod_id, workshop_id)
+        return None
+
+    def get_workshop_details(self, mod_id: str, workshop_id: str | int | None = None) -> dict:
         """返回创意工坊 mod 的详情（主图/轮播图/标签/奖励/简介等）。
-        无论启用/停用/本地，只要有 workshop_id 就查 Steam。"""
+        无论启用/停用/本地，只要有 workshop_id 就查 Steam。
+        workshop_id: 可选，有则精确命中同 mod_id 多 workshop 场景。"""
         from .workshop import fetch_workshop_preview as _fetch
 
-        # 2026-11-04: 从 _mod_versions 找有 workshop_id 的副本（多副本场景下 active_version 可能返回 local 副本）
-        mid_lower = str(mod_id).lower()
-        info = None
-        for v in self.manager._mod_versions.get(mid_lower, []):
-            if v.workshop_id:
-                info = v
-                break
+        info = self._find_workshop_info(mod_id, workshop_id)
         if info is None:
             return {}
         result = _fetch(info.workshop_id, self.manager.get_language())
@@ -2617,12 +2813,13 @@ class Api:
         result["tags"] = merged
         return result
 
-    def is_workshop_cached(self, mod_id: str) -> bool:
-        """该工坊 mod 的预览是否已有缓存（前端据此决定是否显示加载进度条）。"""
+    def is_workshop_cached(self, mod_id: str, workshop_id: str | int | None = None) -> bool:
+        """该工坊 mod 的预览是否已有缓存（前端据此决定是否显示加载进度条）。
+        workshop_id: 可选，有则精确命中同 mod_id 多 workshop 场景。"""
         from .workshop import is_workshop_cached as _check
 
-        info = self.manager.active_version(str(mod_id))
-        if info is None or info.source != "workshop" or not info.workshop_id:
+        info = self._find_workshop_info(mod_id, workshop_id)
+        if info is None:
             return True  # 非工坊 mod 视为「已缓存」，不显示进度条
         return _check(info.workshop_id, self.manager.get_language())
 
@@ -2637,26 +2834,21 @@ class Api:
         _log.info("[api] clear_workshop_cache_force: 删除 %d 个缓存目录", count)
         return {"ok": True, "cleared": count}
 
-    def refresh_workshop_preview(self, mod_id: str) -> dict:
+    def refresh_workshop_preview(self, mod_id: str, workshop_id: str | int | None = None) -> dict:
         """右键菜单：强制删除单个 mod 的两层缓存（steam_webapi 元数据 + workshop 预览），
         然后立刻重抓一次。返回 ok + deleted + title。
 
         通道说明：社区页面（steamcommunity.com）和 Web API（api.steampowered.com）
         独立节流/风控——社区页面被封时只影响 HTML 步骤，Web API 仍能拿到标题/预览 URL。
+        workshop_id: 可选，有则精确命中同 mod_id 多 workshop 场景。
         """
         from .steam_webapi import clear_single_cache as _clear_sw
         from .workshop import clear_single_cache as _clear_ws
         from .workshop import fetch_workshop_preview as _fetch
         from .workshop import _clear_api_fail
 
-        _log.info("[api] refresh_workshop_preview 入口: mod_id=%s", mod_id)
-        # 2026-11-04: 从 _mod_versions 里找有 workshop_id 的副本（多副本场景下 active_version 可能返回 local 副本）
-        mid_lower = str(mod_id).lower()
-        info = None
-        for v in self.manager._mod_versions.get(mid_lower, []):
-            if v.workshop_id:
-                info = v
-                break
+        _log.info("[api] refresh_workshop_preview 入口: mod_id=%s workshop_id=%s", mod_id, workshop_id)
+        info = self._find_workshop_info(mod_id, workshop_id)
         if info is None:
             _log.debug("[api] refresh_workshop_preview 跳过: mod_id=%s（无 workshop 副本）", mod_id)
             return {"ok": False, "error": "no_workshop_id"}
@@ -2816,10 +3008,16 @@ class Api:
     def backup_all(self, scope: str = "all") -> dict:
         """备份全部 mod 或仅当前启用的 mod（异步）。scope: all | enabled。"""
         def _do():
-            if scope == "enabled":
-                infos = self.manager.ordered_enabled()
-            else:
-                infos = list(self.manager.ordered_enabled()) + list(self.manager.ordered_disabled())
+            # 全部物理副本（bucket_key 粒度）——让 backup.py 独立存每个副本
+            infos: list = []
+            for bk, versions in self.manager._mod_versions.items():
+                for v in versions:
+                    if scope == "enabled":
+                        # 只备份实际启用的那个物理副本（_source_states 判定）
+                        if self.manager._copy_baseline_enabled(v):
+                            infos.append(v)
+                    else:
+                        infos.extend(versions)
             candidates = [i for i in infos if i.install_dir is not None]
             skipped = len(infos) - len(candidates)
             mgr = self._bkmgr()
@@ -2948,66 +3146,9 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     def _auto_backup_updated(self) -> None:
-        """已禁用：改为前端弹窗让用户手动选择是否备份更新的 mod。"""
+        """已禁用：改为前端弹窗让用户手动选择是否备份更新的 mod。
+        原函数体首行 return 后面为死代码，已于 2026-11-05 清理。"""
         return
-        # refresh 后检测被 Steam 更新过的 mod，后台自动补一份备份（不阻塞 UI）。
-        try:
-            if False and not self.manager.state().auto_backup:
-                return
-            import os as _os
-            targets = []
-            skipped_large = []
-            for info in list(self.manager.ordered_enabled()) + list(self.manager.ordered_disabled()):
-                if info.install_dir is None:
-                    continue
-                try:
-                    if self._bkmgr().needs_update(info):
-                        # 跳过 >100MB 的超大 mod——自动压缩 1GB 级别目录要几十秒，
-                        # 会把 _IO_POOL 占死导致进程退出时也卡住（ThreadPoolExecutor 等任务完才退）
-                        try:
-                            _size = sum(
-                                (_os.path.getsize(_os.path.join(dp, f)) for dp, dn, fn in _os.walk(str(info.install_dir)) for f in fn)
-                            )
-                        except Exception:
-                            _size = 0
-                        if _size > 100 * 1024 * 1024:
-                            skipped_large.append(f"{info.display_name}({_size // 1024 // 1024}MB)")
-                        else:
-                            targets.append(info)
-                except Exception:
-                    continue
-            if skipped_large:
-                _log.info("[api] auto_backup 跳过 %d 个超大 mod(>100MB): %s", len(skipped_large), skipped_large)
-            if not targets:
-                return
-            _log.info("[api] 检测到 %d 个 mod 已更新，自动备份", len(targets))
-
-            def _run():
-                mgr = self._bkmgr()
-                names = []
-                for info in targets:
-                    try:
-                        mgr.create(info, kind="auto")
-                        names.append(info.display_name)
-                    except Exception as e:
-                        _log.warning("[api] 自动备份失败 %s: %s", info.mod_id, e)
-                if names:
-                    try:
-                        js = "window.__onAutoBackup && window.__onAutoBackup(%s);" % json.dumps(
-                            json.dumps(names, ensure_ascii=False)
-                        )
-                        with _WINDOW_LOCK:
-                            for w in webview.windows:
-                                try:
-                                    w.evaluate_js(js)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-
-            _IO_POOL.submit(_run)
-        except Exception as e:
-            _log.debug("[api] 自动备份检查失败: %s", e)
 
     def open_folder(self, mod_id: str, install_path: str = None) -> dict:
 
@@ -3025,11 +3166,12 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def open_workshop(self, mod_id: str, mode: str = "browser") -> dict:
-        """打开创意工坊详情页。mode: "browser" 浏览器 / "steam" Steam 客户端。"""
+    def open_workshop(self, mod_id: str, mode: str = "browser", workshop_id: str | int | None = None) -> dict:
+        """打开创意工坊详情页。mode: "browser" 浏览器 / "steam" Steam 客户端。
+        workshop_id: 可选，有则精确命中同 mod_id 多 workshop 场景。"""
         import webbrowser
 
-        info = self.manager.active_version(str(mod_id))
+        info = self._find_workshop_info(mod_id, workshop_id)
         if info is None or not info.workshop_id:
             return {"ok": False, "error": self._ui("not_workshop")}
         url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={info.workshop_id}"

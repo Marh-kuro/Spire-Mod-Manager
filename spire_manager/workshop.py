@@ -770,6 +770,15 @@ def _fetch_workshop_page(workshop_id: str, language: str = "zh", *,
     if need_deps:
         _write_deps_cache(wid, deps or [], time_updated=check_time, status="cached")
 
+    # 作者昵称：manifest 里通常为空，社区页 “Created by” 区块有真实昵称；
+    # 页面反正已经抓到，顺手写回 meta 缓存，供列表/预览在没有 manifest 作者时兜底。
+    author_name = _extract_author(html_text)
+    if author_name:
+        cached_meta = _load_cached(wid, language)
+        if cached_meta is not None and str(cached_meta.get("author") or "") != author_name:
+            cached_meta["author"] = author_name
+            _save_cache(wid, cached_meta, None, "image/jpeg")
+
     desc_updated = False
     desc_state = "skipped"
     # 页面已经抓到（无论因为依赖还是手动），描述是免费附带的：顺手解析并落缓存
@@ -1834,10 +1843,10 @@ def run_bg_fill(workshop_ids: list[str], language: str = "zh") -> None:
                     # 统一缓存：RimCrow 式完整版本号追踪
                     # time_updated（时间戳） + revision_change_number（Steam 官方版本号，每次文件变更 +1）
                     # + file_size（当前总大小） → 三个字段对比精准检测 mod 本体/描述/文件的任何变更
-                    "time_updated": api_time_updated or int(old_cache.get("time_updated") or 0),
-                    "revision_change_number": api_rev or int(old_cache.get("revision_change_number") or 0),
-                    "file_size": api_file_size or int(old_cache.get("file_size") or 0),
-                    "subscriptions": api_subscriptions or int(old_cache.get("subscriptions") or 0),
+                    "time_updated": api_time_updated or int((old_cache.get("time_updated") if old_cache else None) or 0),
+                    "revision_change_number": api_rev or int((old_cache.get("revision_change_number") if old_cache else None) or 0),
+                    "file_size": api_file_size or int((old_cache.get("file_size") if old_cache else None) or 0),
+                    "subscriptions": api_subscriptions or int((old_cache.get("subscriptions") if old_cache else None) or 0),
                     "stats": {},
                     "url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={wid}",
                 }
@@ -1862,7 +1871,8 @@ def run_bg_fill(workshop_ids: list[str], language: str = "zh") -> None:
     # fetch_workshop_preview 检测到不完整缓存(_html_fetched=False)时，
     # 立即返回缓存给前端（秒开），同时后台 daemon 线程异步补 HTML。
     # 这样既防止全量爬 HTML 触发 429 风控，又保证用户点选时能尽快看到内容。
-    _set_bg_progress(phase2_total=0, phase2_done=0, phase2_running=False, phase2_ok=True)
+    # phase2 原用于慢速 HTML 补中文，已移除。phase2_* 四个字段现在复用给预览图下载进度。
+    # （即：HTML 补全已关，phase2 字段语义已切换为"预览图下载"）
 
     # --- 后台串行下载 preview_url 到本地（方案 B，RimCrow 方案的取长补短版）---
     #
@@ -1916,10 +1926,22 @@ def run_bg_fill(workshop_ids: list[str], language: str = "zh") -> None:
         # 这里不 return！后面还有 HTML 补全入队要跑
 
     _log.info("[bg-fill] 后台下载 %d 张预览图到本地", len(all_preview_wids))
+
+    # phase2 字段复用给预览图下载进度（HTML 补全已关）
+    _set_bg_progress(
+        phase2_done=0,
+        phase2_total=len(all_preview_wids),
+        phase2_running=bool(all_preview_wids),
+        phase2_ok=not bool(all_preview_wids),   # 空队列直接算完成
+    )
+
     downloaded = 0
+    skipped = 0
     for wid, purl in all_preview_wids:
         cd = _cache_dir(wid)
         if (cd / "preview.jpg").exists() or (cd / "preview.png").exists():
+            skipped += 1
+            _set_bg_progress(phase2_done=skipped + downloaded)
             continue
         try:
             result = _download_image_bytes(purl)
@@ -1932,7 +1954,10 @@ def run_bg_fill(workshop_ids: list[str], language: str = "zh") -> None:
             # 下载失败不计数，也不阻塞——下次启动或用户点选时还能重试
         except Exception as e:
             _log.debug("[bg-fill] 预览图下载 wid=%s 失败: %s", wid, e)
-    _log.info("[bg-fill] 预览图下载完成: %d/%d 成功", downloaded, len(all_preview_wids))
+        _set_bg_progress(phase2_done=skipped + downloaded)
+
+    _set_bg_progress(phase2_running=False, phase2_ok=True)
+    _log.info("[bg-fill] 预览图下载完成: %d/%d 成功，%d 已有本地图跳过", downloaded, len(all_preview_wids), skipped)
 
     # 2026-11-03 重构：enqueue_html_fill 已砍
     # Web API (language=schinese) 直接返回中文 title/description/tags — 零 HTML 补全

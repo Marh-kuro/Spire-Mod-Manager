@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# 设计意图：本文件是 re-export 兼容层。
+# 2026-10 O1-3 重构把 ModManager 类体搬到了 store_mods.py，标签常量搬到了 store_core.py。
+# main.py 和 tools/ 下的多个脚本仍用 `from spire_manager.store import ModManager`，
+# 所以这里统一 re-export 所有符号，保证老导入路径不炸。新代码建议直接 import store_mods。
+
 import functools
 import json
 import os
